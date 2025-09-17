@@ -457,19 +457,84 @@ class OrderTaxVerifier:
         tax = total_price - (total_price / (1.0 + rate))
         return round(tax, 5)
 
-    def _determine_pattern(self, order_data: Dict[str, Any]) -> str:
-        """Determine which discount pattern applies to this order."""
+    def _validate_discount_consistency(self, order_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Validate whether the discount pattern is consistent between item and order levels.
+        
+        Returns a dictionary with:
+        - is_valid: Boolean indicating if discounts are consistent
+        - pattern: The determined discount pattern (corrected if needed)
+        - warning: Warning message if inconsistent
+        - item_discounts: Total item-level discounts
+        - order_discount: Order-level discount
+        - corrected_pattern: True if pattern was corrected from the original determination
+        """
         has_item_discounts = self._has_item_level_discounts(order_data)
         order_discount = self._get_order_level_discount(order_data)
+        item_discounts = self._get_total_item_level_discounts(order_data)
         
+        # Initial pattern determination
         if has_item_discounts and order_discount > 0:
-            return "Pattern 4: Combined (Item + Order Level Discounts)"
+            initial_pattern = "Pattern 4: Combined (Item + Order Level Discounts)"
         elif has_item_discounts:
-            return "Pattern 3: Item-Level Discounts Only"
+            initial_pattern = "Pattern 3: Item-Level Discounts Only"
         elif order_discount > 0:
-            return "Pattern 2: Order-Level Discount Only"
+            initial_pattern = "Pattern 2: Order-Level Discount Only"
         else:
-            return "Pattern 1: No Discounts"
+            initial_pattern = "Pattern 1: No Discounts"
+            
+        # Start with pattern matching the initial determination
+        pattern = initial_pattern
+        is_valid = True
+        warning = None
+        corrected_pattern = False
+        
+        # CASE 1: Detect when Pattern 4 should actually be Pattern 3
+        # If order discount is suspiciously close to item discounts, it's likely a duplicated Pattern 3
+        if initial_pattern == "Pattern 4: Combined (Item + Order Level Discounts)":
+            # If order_discount is approximately equal to item_discounts (within 5%)
+            if abs(order_discount - item_discounts) / max(0.01, item_discounts) < 0.05:
+                is_valid = False
+                pattern = "Pattern 3: Item-Level Discounts Only"  # Correct the pattern
+                corrected_pattern = True
+                warning = (
+                    f"WARNING: Item-Level Total Discounts Calculation Issue.\n"
+                    f"Item-level total discounts: ${item_discounts:.5f}, but paymentDetails.priceDetails.discountAmount: ${order_discount:.5f}.\n"
+                    f"This may indicate an issue with the order payload or discount calculation logic."
+                )
+        
+        # CASE 2: Verify Pattern 3 is used correctly
+        # For Pattern 3, order discount should be 0 or equal to sum of item discounts
+        elif initial_pattern == "Pattern 3: Item-Level Discounts Only" and order_discount > 0.001:
+            # If order discount equals item discounts, it's correct but redundant
+            if abs(order_discount - item_discounts) < 0.01:
+                warning = (
+                    f"NOTE: Pattern 3 detected with order discount ({order_discount:.5f}) equal to item discounts ({item_discounts:.5f}).\n"
+                    f"This is technically correct but redundant - for cleaner data, consider setting order discount to 0."
+                )
+            # Otherwise, there's an inconsistency
+            else:
+                is_valid = False
+                warning = (
+                    f"WARNING: Item-Level Total Discounts Calculation Issue.\n" 
+                    f"Item-level total discounts: ${item_discounts:.5f}, but paymentDetails.priceDetails.discountAmount: ${order_discount:.5f}.\n"
+                    f"This may indicate an issue with the order payload or discount calculation logic."
+                )
+        
+        return {
+            "is_valid": is_valid,
+            "pattern": pattern,
+            "warning": warning,
+            "item_discounts": item_discounts,
+            "order_discount": order_discount,
+            "corrected_pattern": corrected_pattern,
+            "initial_pattern": initial_pattern
+        }
+        
+    def _determine_pattern(self, order_data: Dict[str, Any]) -> str:
+        """Determine which discount pattern applies to this order."""
+        validation = self._validate_discount_consistency(order_data)
+        return validation["pattern"]
 
     def verify(self, order_data: Dict[str, Any]) -> Dict[str, Any]:
         # Build the set of tax IDs that actually appear on menuDetails (items or modifiers)
@@ -540,6 +605,9 @@ class OrderTaxVerifier:
                 }
             )
 
+        # Validate discount consistency
+        discount_validation = self._validate_discount_consistency(order_data)
+        
         summary = {
             "total_taxes": len(comparisons),
             "mismatches": sum(1 for c in comparisons if not c["is_matching"]),
@@ -549,7 +617,11 @@ class OrderTaxVerifier:
                 "order_discount": self._get_order_level_discount(order_data),
                 "item_discounts": self._get_total_item_level_discounts(order_data),
                 "remaining_order_discount": max(0.0, self._get_order_level_discount(order_data) - self._get_total_item_level_discounts(order_data)) if self._has_item_level_discounts(order_data) and self._get_order_level_discount(order_data) > 0 else (0.0 if self._has_item_level_discounts(order_data) else self._get_order_level_discount(order_data)),
-                "pattern": self._determine_pattern(order_data)
+                "pattern": discount_validation["pattern"],
+                "initial_pattern": discount_validation.get("initial_pattern"),
+                "corrected_pattern": discount_validation.get("corrected_pattern", False),
+                "discount_valid": discount_validation["is_valid"],
+                "discount_warning": discount_validation["warning"]
             }
         }
         return {"comparisons": comparisons, "summary": summary}

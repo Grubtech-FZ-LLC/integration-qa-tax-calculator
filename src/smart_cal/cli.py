@@ -67,6 +67,12 @@ Examples:
         help="Database environment (default: staging)",
     )
     
+    verify_parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Enable verbose logging",
+    )
+    
     return parser
 
 
@@ -144,13 +150,24 @@ def verify_order_tax(order_id: str, environment: str = "staging") -> None:
     summary = result.get('summary', {})
     if 'pattern_info' in summary:
         pattern_info = summary['pattern_info']
+        
+        # Show discount pattern - without mentioning correction to avoid confusion
         print(f"\nDiscount Pattern: {pattern_info.get('pattern', 'Unknown')}")
+            
+        # Show discount amounts
         if pattern_info.get('item_discounts', 0) > 0:
             print(f"Item-Level Discounts:   ${pattern_info['item_discounts']:.5f}")
         if pattern_info.get('order_discount', 0) > 0:
             print(f"Order-Level Discount:   ${pattern_info['order_discount']:.5f}")
         if pattern_info.get('remaining_order_discount', 0) > 0:
             print(f"Remaining Order Disc:   ${pattern_info['remaining_order_discount']:.5f}")
+            
+        # Display discount validation warnings if present
+        if 'discount_valid' in pattern_info and not pattern_info['discount_valid']:
+            print(f"\n\033[1m\033[33m⚠️  DISCOUNT VALIDATION WARNING ⚠️\033[0m")
+            if pattern_info.get('discount_warning'):
+                print(f"\033[33m{pattern_info['discount_warning']}\033[0m")
+            print(f"\033[33mRecommendation: Check the original order payload and discount application logic.\033[0m")
     
     print(f"\nTAX BREAKDOWN BY RATE:")
     print(f"-" * 40)
