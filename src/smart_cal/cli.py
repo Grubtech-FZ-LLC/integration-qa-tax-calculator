@@ -3,8 +3,10 @@ Command-line interface for Smart Cal.
 """
 
 import argparse
+import os
 import sys
 from typing import Optional
+from dotenv import load_dotenv
 
 from . import __version__
 from .utils.logging import setup_logging
@@ -87,6 +89,9 @@ def verify_order_tax(order_id: str, environment: str = "staging") -> None:
     logger = setup_logging()
     logger.info(f"Verifying tax for order: {order_id} in {environment} environment")
     
+    # Load environment variables from .env file
+    load_dotenv('.env')
+    
     # Map environment aliases
     env_map = {
         "staging": "stg",
@@ -96,12 +101,21 @@ def verify_order_tax(order_id: str, environment: str = "staging") -> None:
     }
     env_key = env_map.get(environment.lower(), "stg")
     
-    # Database name mapping
-    db_names = {
-        "stg": "GRUBTECH_MASTER_DATA_STG_V2",
-        "prod": "GRUBTECH_MASTER_DATA_PROD_V2"
+    # Database configuration mapping
+    db_configs = {
+        "stg": {
+            "db_name_key": "DB_NAME_STG",
+            "connection_url": "DB_CONNECTION_URL_STG"  # Environment-specific URL
+        },
+        "prod": {
+            "db_name_key": "DB_NAME_PROD", 
+            "connection_url": "DB_CONNECTION_URL_PROD"  # Environment-specific URL
+        }
     }
-    db_name = db_names[env_key]
+    
+    config = db_configs[env_key]
+    # Get environment-specific database name, fallback to default
+    db_name = os.getenv(config["db_name_key"]) or os.getenv('DB_NAME')
     
     print(f"🔍 Environment: {environment.upper()}")
     print(f"📊 Database: {db_name}")
@@ -109,7 +123,11 @@ def verify_order_tax(order_id: str, environment: str = "staging") -> None:
     print("=" * 50)
     
     try:
-        verification_service = TaxVerificationService(db_name=db_name)
+        # Pass environment-specific connection URL
+        verification_service = TaxVerificationService(
+            db_name=db_name,
+            connection_url_env_key=config["connection_url"]
+        )
         result = verification_service.verify_order_by_id(order_id)
     except ValueError as e:
         # Handle tax assignment errors gracefully
@@ -169,6 +187,143 @@ def verify_order_tax(order_id: str, environment: str = "staging") -> None:
                 print(f"\033[33m{pattern_info['discount_warning']}\033[0m")
             print(f"\033[33mRecommendation: Check the original order payload and discount application logic.\033[0m")
     
+    # New: menuDetails price calculations validation section
+    menu_validation = summary.get('menu_calculations_validation')
+    if menu_validation:
+        print("\nMENU DETAILS PRICE CALCULATIONS VALIDATION:")
+        print("=" * 55)
+        
+        total_items = menu_validation.get('total_items', 0)
+        is_valid = menu_validation.get('is_valid', False)
+        calculation_errors = menu_validation.get('calculation_errors', [])
+        validation_details = menu_validation.get('validation_details', [])
+        
+        status = "PASS" if is_valid else "FAIL"
+        print(f"   Overall Calculation Status: {status}")
+        print(f"   Items Validated: {total_items}")
+        
+        if calculation_errors:
+            print(f"   Calculation Errors Found: {len(calculation_errors)}")
+        
+        # Show detailed calculation validation for each item
+        if validation_details:
+            print(f"\n   DETAILED CALCULATION VALIDATION:")
+            print(f"   " + "-" * 50)
+            
+            for item_validation in validation_details:
+                item_name = item_validation.get('item_name', 'Unknown Item')
+                item_id = item_validation.get('item_id', 'Unknown ID')
+                item_type = item_validation.get('item_type', 'item')
+                qty = item_validation.get('qty', 1)
+                tax_rate = item_validation.get('tax_rate', 0)
+                
+                # Display main item (always starts with 📦)
+                print(f"\n   📦 Item: {item_name} (ID: {item_id})")
+                print(f"      Qty: {qty}, Tax Rate: {tax_rate:.2f}%")
+                
+                # Display main item calculations
+                calculations = item_validation.get('calculations', {})
+                for field_name, calc_data in calculations.items():
+                    actual = calc_data.get('actual', 0)
+                    expected = calc_data.get('expected', 0)
+                    delta = calc_data.get('delta', 0)
+                    is_calc_valid = calc_data.get('is_valid', False)
+                    formula = calc_data.get('formula', '')
+                    
+                    status_icon = "✅" if is_calc_valid else "❌"
+                    print(f"      {status_icon} {field_name:20}: actual={actual:>10.5f} | expected={expected:>10.5f} | delta={delta:>10.8f}")
+                    if not is_calc_valid:
+                        print(f"         Formula: {formula}")
+                
+                # Display modifiers nested under the main item
+                modifiers = item_validation.get('modifiers', [])
+                for modifier_validation in modifiers:
+                    mod_name = modifier_validation.get('item_name', 'Unknown Modifier')
+                    mod_id = modifier_validation.get('item_id', 'Unknown ID')
+                    mod_qty = modifier_validation.get('qty', 1)
+                    mod_tax_rate = modifier_validation.get('tax_rate', 0)
+                    
+                    print(f"\n      🔧 Modifier: {mod_name} (ID: {mod_id})")
+                    print(f"         Qty: {mod_qty}, Tax Rate: {mod_tax_rate:.2f}%")
+                    
+                    # Display modifier calculations with extra indentation
+                    mod_calculations = modifier_validation.get('calculations', {})
+                    for field_name, calc_data in mod_calculations.items():
+                        actual = calc_data.get('actual', 0)
+                        expected = calc_data.get('expected', 0)
+                        delta = calc_data.get('delta', 0)
+                        is_calc_valid = calc_data.get('is_valid', False)
+                        formula = calc_data.get('formula', '')
+                        
+                        status_icon = "✅" if is_calc_valid else "❌"
+                        print(f"         {status_icon} {field_name:20}: actual={actual:>10.5f} | expected={expected:>10.5f} | delta={delta:>10.8f}")
+                        if not is_calc_valid:
+                            print(f"            Formula: {formula}")
+        
+        if not is_valid:
+            validation_note = menu_validation.get('validation_note', 
+                'Some price calculations in menuDetails are mathematically inconsistent!')
+            discount_context = menu_validation.get('discount_context', '')
+            
+            print(f"\n   ⚠️  {validation_note}")
+            if discount_context:
+                print(f"   🔍 Context: {discount_context}")
+            print(f"   💡 This may indicate data integrity issues or expected discount processing behavior.")
+    
+    # Optional: menuDetails vs itemDetails consistency section
+    consistency = summary.get('menu_item_consistency')
+    if consistency:
+        print("\nMENU / ITEM DETAILS CONSISTENCY:")
+        print("=" * 50)
+        if not consistency.get('available'):
+            print(f"   ItemDetails not present ({consistency.get('reason','')}). Skipping comparison.")
+        else:
+            status = "PASS" if consistency.get('is_consistent') else "FAIL"
+            print(f"   Overall Status: {status}")
+            print(f"   Items Compared: {consistency.get('total_compared',0)}")
+            unmatched_menu = consistency.get('unmatched_in_menu',0)
+            unmatched_item = consistency.get('unmatched_in_item',0)
+            if unmatched_menu or unmatched_item:
+                print(f"   Unmatched - menuDetails: {unmatched_menu}, itemDetails: {unmatched_item}")
+            
+            # Show detailed field-by-field comparison for all items
+            items_detail = consistency.get('items_detail', [])
+            if items_detail:
+                print(f"\n   DETAILED FIELD COMPARISON:")
+                print(f"   " + "-" * 47)
+                for item_detail in items_detail:
+                    item_key = item_detail.get('key', 'Unknown')
+                    item_name = item_detail.get('name', 'Unknown Item')
+                    print(f"\n   📦 Item: {item_name} (ID: {item_key})")
+                    
+                    fields = item_detail.get('fields', {})
+                    for field_name, field_data in fields.items():
+                        menu_val = field_data.get('menu_value', 0)
+                        item_val = field_data.get('item_value', 0)
+                        delta = field_data.get('delta', 0)
+                        is_match = abs(delta) <= consistency.get('tolerance', 1e-5)
+                        
+                        status_icon = "✅" if is_match else "❌"
+                        if field_name == 'qty':
+                            print(f"      {status_icon} {field_name:20}: menu={int(menu_val):>8} | item={int(item_val):>8} | delta={int(delta):>8}")
+                        else:
+                            print(f"      {status_icon} {field_name:20}: menu={menu_val:>8.5f} | item={item_val:>8.5f} | delta={delta:>8.5f}")
+            else:
+                diffs = consistency.get('differences', [])
+                if diffs:
+                    print(f"   Differences (showing up to 5):")
+                    for d in diffs[:5]:
+                        locator = d.get('key', d.get('index','?'))
+                        field = d.get('field')
+                        delta = d.get('delta')
+                        menu_val = d.get('menu_value')
+                        item_val = d.get('item_value')
+                        print(f"      [{locator}] {field}: menu={menu_val} item={item_val} delta={delta}")
+                    if len(diffs) > 5:
+                        print(f"      ... {len(diffs)-5} more differences not shown")
+                else:
+                    print("   ✅ All fields match perfectly across all items!")
+
     print(f"\nTAX BREAKDOWN BY RATE:")
     print(f"-" * 40)
     

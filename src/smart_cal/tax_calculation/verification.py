@@ -10,13 +10,17 @@ from .repository import OrderRepository
 class TaxVerificationService:
     """High-level service for tax verification operations."""
     
-    def __init__(self, db_name: str = None):
+    def __init__(self, db_name: str = None, connection_url_env_key: str = None):
         self.verifier = OrderTaxVerifier()
         self.db_name = db_name
+        self.connection_url_env_key = connection_url_env_key
         
     def verify_order_by_id(self, order_id: str) -> Dict[str, Any]:
         """Verify tax calculations for an order by its internal ID."""
-        with OrderRepository(db_name=self.db_name) as repo:
+        with OrderRepository(
+            db_name=self.db_name, 
+            connection_url_env_key=self.connection_url_env_key
+        ) as repo:
             order_data = repo.get_order_by_internal_id(order_id)
             if not order_data:
                 raise ValueError(f"Order with ID {order_id} not found")
@@ -494,13 +498,12 @@ class OrderTaxVerifier:
         if initial_pattern == "Pattern 4: Combined (Item + Order Level Discounts)":
             # If order_discount is approximately equal to item_discounts (within 5%)
             if abs(order_discount - item_discounts) / max(0.01, item_discounts) < 0.05:
-                is_valid = False
+                # This is actually correct for Pattern 3 - just reclassify without warning
                 pattern = "Pattern 3: Item-Level Discounts Only"  # Correct the pattern
                 corrected_pattern = True
                 warning = (
-                    f"WARNING: Item-Level Total Discounts Calculation Issue.\n"
-                    f"Item-level total discounts: ${item_discounts:.5f}, but paymentDetails.priceDetails.discountAmount: ${order_discount:.5f}.\n"
-                    f"This may indicate an issue with the order payload or discount calculation logic."
+                    f"NOTE: Reclassified from Pattern 4 to Pattern 3.\n"
+                    f"Order discount (${order_discount:.5f}) equals item discounts (${item_discounts:.5f}), indicating item-level discounts only."
                 )
         
         # CASE 2: Verify Pattern 3 is used correctly
@@ -608,6 +611,12 @@ class OrderTaxVerifier:
         # Validate discount consistency
         discount_validation = self._validate_discount_consistency(order_data)
         
+        # Validate menuDetails price calculations
+        menu_calculations_validation = self._validate_menu_details_calculations(order_data)
+        
+        # Compare menuDetails vs itemDetails consistency
+        menu_item_consistency = self._compare_menu_and_item_details(order_data)
+        
         summary = {
             "total_taxes": len(comparisons),
             "mismatches": sum(1 for c in comparisons if not c["is_matching"]),
@@ -622,6 +631,480 @@ class OrderTaxVerifier:
                 "corrected_pattern": discount_validation.get("corrected_pattern", False),
                 "discount_valid": discount_validation["is_valid"],
                 "discount_warning": discount_validation["warning"]
-            }
+            },
+            "menu_calculations_validation": menu_calculations_validation,
+            "menu_item_consistency": menu_item_consistency
         }
         return {"comparisons": comparisons, "summary": summary}
+
+    # ---------------------------------------------------------------------
+    # New integrity check: Validate menuDetails price calculations
+    # ---------------------------------------------------------------------
+    def _validate_menu_details_calculations(self, order_data: Dict[str, Any], tolerance: float = 1e-5) -> Dict[str, Any]:
+        """Validate mathematical correctness of price calculations within menuDetails.price.
+
+        This validation ensures that all price fields within menuDetails are mathematically consistent:
+        - grossAmount = unitPrice * qty (before discounts)
+        - netAmount = grossAmount - discountAmount (after item discounts)
+        - For tax-free items: taxExclusiveUnitPrice = unitPrice, taxAmount = 0.0
+        - For taxed items: taxExclusiveUnitPrice = unitPrice / (1 + taxRate)
+        - taxExclusiveDiscountAmount = discountAmount / (1 + taxRate) for tax-inclusive
+        - taxAmount = (grossAmount - discountAmount) - (taxExclusiveAmount) for tax-inclusive
+        - totalPrice:
+            Pattern 1 (No discounts): grossAmount
+            Patterns 2-4 (any discounts present): grossAmount - discountAmount
+
+        Also validates modifiers/extraDetails pricing with same rules.
+        
+        NOTE: This validation checks the mathematical relationships within menuDetails.price structure.
+        The values may already reflect applied discounts based on the discount pattern (Pattern 1-4).
+
+        Returns dict with:
+            is_valid: bool -> True if all calculations are mathematically correct
+            total_items: int -> Number of items validated (including modifiers)
+            validation_details: List[Dict] -> Per-item validation results
+            calculation_errors: List[Dict] -> List of calculation mismatches
+        """
+        
+        menu_items = order_data.get("menuDetails") or []
+        order_taxes = {tax.get("_id"): tax for tax in order_data.get("orderTaxes", [])}
+        
+        # Check discount pattern context for better error reporting
+        has_item_discounts = self._has_item_level_discounts(order_data)
+        order_discount = self._get_order_level_discount(order_data)
+        
+        if has_item_discounts and order_discount > 0:
+            discount_context = "Pattern 4: Combined Discounts"
+        elif has_item_discounts:
+            discount_context = "Pattern 3: Item-Level Discounts Only"
+        elif order_discount > 0:
+            discount_context = "Pattern 2: Order-Level Discount Only"
+        else:
+            discount_context = "Pattern 1: No Discounts"
+        
+        validation_details = []
+        calculation_errors = []
+        total_items = 0
+        
+        def validate_price_object(item_data, item_type="item", parent_qty=1):
+            """Helper to validate a single price object (item or modifier) with pattern awareness"""
+            nonlocal total_items, validation_details, calculation_errors
+            
+            item_name = item_data.get("name", "Unknown Item")
+            item_id = item_data.get("internalId", item_data.get("_id", "Unknown ID"))
+            qty = item_data.get("qty", 1)
+            price = item_data.get("price", {})
+            taxes = item_data.get("taxes", [])
+            
+            total_items += 1
+            
+            # Extract price fields (actual values from database)
+            unit_price = float(price.get("unitPrice", 0))
+            gross_amount = float(price.get("grossAmount", 0))
+            tax_exclusive_unit_price = float(price.get("taxExclusiveUnitPrice", 0))
+            discount_amount = float(price.get("discountAmount", 0))
+            tax_exclusive_discount_amount = float(price.get("taxExclusiveDiscountAmount", 0))
+            tax_amount = float(price.get("taxAmount", 0))
+            net_amount = float(price.get("netAmount", 0))
+            total_price = float(price.get("totalPrice", 0))
+            
+            # Calculate tax rate from taxes array first
+            total_tax_rate = 0.0
+            for tax_entry in taxes:
+                tax_id = tax_entry.get("taxId")
+                if tax_id in order_taxes:
+                    tax_rate = float(order_taxes[tax_id].get("rate", 0))
+                    total_tax_rate += tax_rate
+            
+            # If no tax rate found in taxes array, derive it from price relationships
+            if total_tax_rate == 0.0 and tax_exclusive_unit_price > 0 and unit_price > tax_exclusive_unit_price:
+                derived_tax_rate = ((unit_price / tax_exclusive_unit_price) - 1) * 100
+                total_tax_rate = derived_tax_rate
+            
+            tax_rate_decimal = total_tax_rate / 100.0
+            
+            # Pattern-aware expected calculations
+            expected_gross_amount = unit_price * qty
+            is_taxed = (tax_amount > 0.0 or tax_exclusive_unit_price != unit_price or total_tax_rate > 0.0)
+            
+            if not is_taxed:
+                # Tax-free item logic (same for all patterns)
+                expected_tax_exclusive_unit_price = unit_price
+                expected_tax_exclusive_discount = discount_amount
+                expected_tax_amount = 0.0
+                expected_net_amount = gross_amount - discount_amount
+                expected_total_price = gross_amount
+            else:
+                # Tax-inclusive item logic with pattern awareness
+                if tax_rate_decimal > 0:
+                    expected_tax_exclusive_unit_price = unit_price / (1 + tax_rate_decimal)
+                    expected_tax_exclusive_discount = discount_amount / (1 + tax_rate_decimal)
+                else:
+                    expected_tax_exclusive_unit_price = tax_exclusive_unit_price
+                    expected_tax_exclusive_discount = tax_exclusive_discount_amount
+                
+                # Calculate expected tax amount based on pattern
+                if "Pattern 1" in discount_context:
+                    # No discounts: tax calculated on full gross amount
+                    taxable_amount = gross_amount
+                elif "Pattern 2" in discount_context:
+                    # Order-level discount: Database values may reflect distributed discount
+                    # For validation, we expect the actual stored taxAmount to be correct
+                    # as it already accounts for the discount distribution
+                    taxable_amount = gross_amount - discount_amount  # This may not match if order discount was distributed
+                elif "Pattern 3" in discount_context:
+                    # Item-level discount only: tax calculated after item discount
+                    taxable_amount = gross_amount - discount_amount
+                elif "Pattern 4" in discount_context:
+                    # Combined discounts: complex calculation, database values should be trusted more
+                    taxable_amount = gross_amount - discount_amount
+                else:
+                    # Default case
+                    taxable_amount = gross_amount - discount_amount
+                
+                # Calculate expected tax amount
+                if tax_rate_decimal > 0:
+                    expected_tax_amount = taxable_amount - (taxable_amount / (1.0 + tax_rate_decimal))
+                else:
+                    expected_tax_amount = 0.0
+                
+                expected_tax_exclusive_gross = expected_tax_exclusive_unit_price * qty
+                expected_net_amount = expected_tax_exclusive_gross - expected_tax_exclusive_discount
+                # Pattern-aware expected totalPrice
+                if "Pattern 1" in discount_context and discount_amount == 0:
+                    expected_total_price = gross_amount
+                    total_price_formula = f"grossAmount({gross_amount}) (no discounts)"
+                else:
+                    expected_total_price = gross_amount - discount_amount
+                    total_price_formula = f"grossAmount({gross_amount}) - discountAmount({discount_amount})"
+            
+            # For Pattern 2 and Pattern 4, relax validation for tax and net amounts
+            # as they may legitimately differ due to discount distribution
+            pattern_adjusted_tolerance = tolerance
+            if "Pattern 2" in discount_context or "Pattern 4" in discount_context:
+                pattern_adjusted_tolerance = max(tolerance, 1.0)  # Allow up to $1 difference for discount-affected fields
+            
+            # Validate calculations with pattern-aware tolerance
+            item_validation = {
+                "item_id": item_id,
+                "item_name": item_name,
+                "item_type": item_type,
+                "qty": qty,
+                "tax_rate": total_tax_rate,
+                "calculations": {},
+                "pattern_context": discount_context
+            }
+            
+            # Check each calculation with appropriate logic and tolerance
+            calculations = [
+                ("grossAmount", gross_amount, expected_gross_amount, f"unitPrice({unit_price}) × qty({qty})", tolerance),
+                ("taxExclusiveUnitPrice", tax_exclusive_unit_price, expected_tax_exclusive_unit_price, 
+                 f"unitPrice({unit_price})" if not is_taxed else f"unitPrice({unit_price}) ÷ (1 + {tax_rate_decimal:.5f}) = {expected_tax_exclusive_unit_price:.5f}", tolerance),
+                ("taxExclusiveDiscountAmount", tax_exclusive_discount_amount, expected_tax_exclusive_discount,
+                 f"discountAmount({discount_amount})" if not is_taxed else f"discountAmount({discount_amount}) ÷ (1 + {tax_rate_decimal:.5f})", tolerance),
+                ("taxAmount", tax_amount, expected_tax_amount, 
+                 "0.0 (tax-free)" if not is_taxed else f"taxable_amount - (taxable_amount ÷ (1 + {tax_rate_decimal:.5f})) = {expected_tax_amount:.5f}", pattern_adjusted_tolerance),
+                ("netAmount", net_amount, expected_net_amount, 
+                 f"grossAmount({gross_amount}) - discountAmount({discount_amount})" if not is_taxed else f"tax-exclusive amount after discounts = {expected_net_amount:.5f}", pattern_adjusted_tolerance),
+                ("totalPrice", total_price, expected_total_price, total_price_formula, tolerance),
+            ]
+            
+            for field_name, actual, expected, formula, field_tolerance in calculations:
+                delta = actual - expected
+                is_valid = abs(delta) <= field_tolerance
+                
+                item_validation["calculations"][field_name] = {
+                    "actual": actual,
+                    "expected": expected,
+                    "delta": round(delta, 8),
+                    "is_valid": is_valid,
+                    "formula": formula,
+                    "tolerance_used": field_tolerance
+                }
+                
+                if not is_valid:
+                    calculation_errors.append({
+                        "item_id": item_id,
+                        "item_name": item_name,
+                        "item_type": item_type,
+                        "field": field_name,
+                        "actual": actual,
+                        "expected": expected,
+                        "delta": round(delta, 8),
+                        "formula": formula,
+                        "pattern_context": discount_context,
+                        "tolerance_used": field_tolerance
+                    })
+            
+            validation_details.append(item_validation)
+        
+        # Validate main items and their modifiers hierarchically
+        for item in menu_items:
+            # Validate main item
+            validate_price_object(item, "main_item")
+            
+            # Store the current main item for hierarchical display
+            main_item_validation = validation_details[-1] if validation_details else None
+            
+            # Validate modifiers/extraDetails if present and group under main item
+            extra_details = item.get("extraDetails", [])
+            modifier_validations = []
+            for modifier in extra_details:
+                validate_price_object(modifier, "modifier")
+                # Move the modifier validation to be nested under the main item
+                if validation_details:
+                    modifier_validation = validation_details.pop()  # Remove from main list
+                    modifier_validations.append(modifier_validation)
+            
+            # Add modifiers to the main item validation
+            if main_item_validation and modifier_validations:
+                main_item_validation["modifiers"] = modifier_validations
+        
+        is_valid = len(calculation_errors) == 0
+        
+        return {
+            "is_valid": is_valid,
+            "total_items": total_items,
+            "validation_details": validation_details,
+            "calculation_errors": calculation_errors,
+            "tolerance": tolerance,
+            "discount_context": discount_context,
+            "validation_note": self._get_validation_note(discount_context, is_valid, calculation_errors)
+        }
+
+    def _get_validation_note(self, discount_context: str, is_valid: bool, calculation_errors: list) -> str:
+        """Provide context-aware validation notes based on discount patterns."""
+        if is_valid:
+            return f"All calculations are mathematically consistent within menuDetails.price structure. ({discount_context})"
+        
+        if "Pattern 1" in discount_context:
+            return ("Pattern 1: No discounts applied. Mathematical inconsistencies indicate "
+                   "potential data integrity issues in the source system.")
+        
+        elif "Pattern 2" in discount_context:
+            # Check if errors are related to tax/net amounts which are expected in Pattern 2
+            tax_or_net_errors = [err for err in calculation_errors 
+                               if err.get('field') in ['taxAmount', 'netAmount']]
+            if tax_or_net_errors:
+                return ("Pattern 2: Order-level discount detected. Some discrepancies in tax/net amounts "
+                       "may be expected as order-level discounts are distributed across items during processing, "
+                       "affecting the final calculations stored in menuDetails.price structure.")
+            else:
+                return ("Pattern 2: Order-level discount detected. Validation errors in non-discount fields "
+                       "may indicate data integrity issues.")
+        
+        elif "Pattern 3" in discount_context:
+            return ("Pattern 3: Item-level discounts detected. Calculations should be consistent as "
+                   "item discounts are typically applied at the item level before tax calculation.")
+        
+        elif "Pattern 4" in discount_context:
+            return ("Pattern 4: Combined discounts detected. Complex discount interactions may cause "
+                   "validation differences between calculated and stored values due to multi-stage "
+                   "discount application (item discounts first, then order discount distribution).")
+        
+        return f"Some price calculations are mathematically inconsistent! ({discount_context})"
+
+    # ---------------------------------------------------------------------
+    # New integrity check: Compare menuDetails[] vs itemDetails[] (if present)
+    # ---------------------------------------------------------------------
+    def _compare_menu_and_item_details(self, order_data: Dict[str, Any], tolerance: float = 1e-5) -> Dict[str, Any]:
+        """Validate that duplicated item arrays (menuDetails vs itemDetails) match.
+
+        This comprehensive comparison validates all monetary fields between menuDetails.price
+        and itemDetails pricing structures to ensure data consistency across representations.
+
+        Comparison Strategy:
+        1. If `itemDetails` absent or empty, mark as not available but not a failure.
+        2. Match items by stable identifier (internalId -> _id -> id -> name fallback).
+        3. For each matched pair, compare all price fields within tolerance:
+           - qty vs quantity
+           - price.unitPrice vs unitPrice (or nested price.unitPrice.amount)
+           - price.grossAmount vs grossAmount
+           - price.taxExclusiveUnitPrice vs taxExclusiveUnitPrice
+           - price.discountAmount vs discountAmount
+           - price.taxExclusiveDiscountAmount vs taxExclusiveDiscountAmount
+           - price.taxAmount vs taxAmount
+           - price.netAmount vs netAmount
+           - price.totalPrice vs totalPrice
+        4. Record any differences exceeding tolerance.
+
+        Returns dict with:
+            available: bool        -> Whether itemDetails existed for comparison
+            is_consistent: bool    -> True if no material differences
+            total_compared: int    -> Number of items compared
+            differences: List[Dict]-> Each difference entry
+            unmatched_in_menu: int -> Count of menu items without counterpart
+            unmatched_in_item: int -> Count of itemDetails without counterpart
+            matching_key: str      -> The identifier key used for matching
+        """
+
+        menu_items = order_data.get("menuDetails") or []
+        raw_item_details = order_data.get("itemDetails") or []
+
+        # Accept either list form or {"items": [...]} container
+        if isinstance(raw_item_details, dict):
+            item_items = raw_item_details.get("items", []) or []
+        else:
+            item_items = raw_item_details
+
+        if not item_items:
+            return {
+                "available": False,
+                "reason": "itemDetails array not present or empty",
+                "is_consistent": True,
+                "total_compared": 0,
+                "differences": [],
+                "unmatched_in_menu": 0,
+                "unmatched_in_item": 0,
+                "matching_key": None,
+            }
+
+        # Helper to extract a candidate key
+        def extract_key(obj: Dict[str, Any]):
+            for k in ("internalId", "_id", "id"):
+                if k in obj and obj.get(k) not in (None, ""):
+                    return str(obj.get(k))
+            # Fallback to name (may not be unique)
+            return f"NAME::{obj.get('name', '')}"
+
+        # Helper to extract price field from menuDetails.price structure
+        def extract_menu_price_field(menu_item: Dict[str, Any], field: str) -> float:
+            price_obj = menu_item.get("price") or {}
+            value = price_obj.get(field, 0.0)
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return 0.0
+
+        # Helper to extract price field from itemDetails (supports nested price.field.amount)
+        def extract_item_price_field(item_detail: Dict[str, Any], field: str) -> float:
+            # Check direct field first
+            if field in item_detail:
+                value = item_detail[field]
+                if isinstance(value, dict) and "amount" in value:
+                    value = value.get("amount", 0.0)
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    return 0.0
+            
+            # Check nested in price object
+            price_obj = item_detail.get("price") or {}
+            if field in price_obj:
+                value = price_obj[field]
+                if isinstance(value, dict) and "amount" in value:
+                    value = value.get("amount", 0.0)
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    return 0.0
+            
+            return 0.0
+
+        menu_map = {}
+        item_map = {}
+        
+        # Build maps for matching
+        for m in menu_items:
+            key = extract_key(m)
+            menu_map[key] = m
+        for it in item_items:
+            key = extract_key(it)
+            item_map[key] = it
+
+        differences: List[Dict[str, Any]] = []
+        unmatched_in_menu = 0
+        unmatched_in_item = 0
+        total_compared = 0
+
+        # Define all fields to compare between menuDetails.price and itemDetails
+        fields_to_check = [
+            ("qty", lambda m: int(m.get("qty", 1)), lambda i: int(i.get("qty", i.get("quantity", 1)))),
+            ("unitPrice", lambda m: extract_menu_price_field(m, "unitPrice"), lambda i: extract_item_price_field(i, "unitPrice")),
+            ("grossAmount", lambda m: extract_menu_price_field(m, "grossAmount"), lambda i: extract_item_price_field(i, "grossAmount")),
+            ("taxExclusiveUnitPrice", lambda m: extract_menu_price_field(m, "taxExclusiveUnitPrice"), lambda i: extract_item_price_field(i, "taxExclusiveUnitPrice")),
+            ("discountAmount", lambda m: extract_menu_price_field(m, "discountAmount"), lambda i: extract_item_price_field(i, "discountAmount")),
+            ("taxExclusiveDiscountAmount", lambda m: extract_menu_price_field(m, "taxExclusiveDiscountAmount"), lambda i: extract_item_price_field(i, "taxExclusiveDiscountAmount")),
+            ("taxAmount", lambda m: extract_menu_price_field(m, "taxAmount"), lambda i: extract_item_price_field(i, "taxAmount")),
+            ("netAmount", lambda m: extract_menu_price_field(m, "netAmount"), lambda i: extract_item_price_field(i, "netAmount")),
+            ("totalPrice", lambda m: extract_menu_price_field(m, "totalPrice"), lambda i: extract_item_price_field(i, "totalPrice")),
+        ]
+
+        # Keyed comparison
+        all_keys = set(menu_map.keys()) | set(item_map.keys())
+        items_detail = []  # Detailed information for each item comparison
+        
+        for key in all_keys:
+            m_entry = menu_map.get(key)
+            i_entry = item_map.get(key)
+            
+            if m_entry is None:
+                unmatched_in_item += 1
+                continue
+            if i_entry is None:
+                unmatched_in_menu += 1
+                continue
+                
+            total_compared += 1
+            
+            # Collect detailed field information for this item
+            item_detail = {
+                "key": key,
+                "name": m_entry.get("name", "Unknown Item"),
+                "fields": {}
+            }
+            
+            for field_name, menu_extractor, item_extractor in fields_to_check:
+                try:
+                    mv = menu_extractor(m_entry)
+                    iv = item_extractor(i_entry)
+                    delta = mv - iv
+                    
+                    # Store detailed field information
+                    item_detail["fields"][field_name] = {
+                        "menu_value": mv,
+                        "item_value": iv,
+                        "delta": round(delta, 5)
+                    }
+                    
+                    # Also collect differences for backward compatibility
+                    if abs(delta) > tolerance:
+                        differences.append({
+                            "key": key,
+                            "field": field_name,
+                            "menu_value": mv,
+                            "item_value": iv,
+                            "delta": round(delta, 5)
+                        })
+                except Exception:  # defensive: ignore extraction errors per field
+                    item_detail["fields"][field_name] = {
+                        "menu_value": "ERR",
+                        "item_value": "ERR",
+                        "delta": None
+                    }
+                    differences.append({
+                        "key": key,
+                        "field": field_name,
+                        "menu_value": "ERR",
+                        "item_value": "ERR",
+                        "delta": None,
+                        "issue": "extraction_error"
+                    })
+            
+            items_detail.append(item_detail)
+
+        is_consistent = (
+            len(differences) == 0 and unmatched_in_menu == 0 and unmatched_in_item == 0
+        )
+
+        return {
+            "available": True,
+            "is_consistent": is_consistent,
+            "total_compared": total_compared,
+            "differences": differences,
+            "unmatched_in_menu": unmatched_in_menu,
+            "unmatched_in_item": unmatched_in_item,
+            "matching_key": "identifier",
+            "tolerance": tolerance,
+            "items_detail": items_detail,  # New detailed information
+        }

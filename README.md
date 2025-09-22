@@ -283,3 +283,95 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 **Smart Cal** - Accurate tax verification for modern commerce platforms 🧮✨
 
+## 🔍 Menu / Item Details Consistency Verification
+
+This feature cross-validates pricing and quantity attributes between the two common order structures found in restaurant platform schemas:
+
+- `menuDetails[]`: Original menu representation (items and optionally modifiers/extraDetails)
+- `itemDetails[]`: Normalized pricing structure often used for settlement and taxation
+
+### What It Does Now
+The current implementation performs a comprehensive comparison for overlapping items (matched by internal IDs) across all pricing fields:
+- Quantity (`qty`)
+- Unit Price (`unitPrice` or nested `price.unitPrice.amount`)
+- Gross Amount (`grossAmount` or nested `price.grossAmount.amount`)
+- Tax Exclusive Unit Price (`taxExclusiveUnitPrice` or nested `price.taxExclusiveUnitPrice.amount`)
+- Discount Amount (`discountAmount` or nested `price.discountAmount.amount`)
+- Tax Exclusive Discount Amount (`taxExclusiveDiscountAmount` or nested `price.taxExclusiveDiscountAmount.amount`)
+- Tax Amount (`taxAmount` or nested `price.taxAmount.amount`)
+- Net Amount (`netAmount` or nested `price.netAmount.amount`)
+- Total (line) Price (`totalPrice` or nested `price.totalPrice.amount`)
+
+Numeric comparisons use a small tolerance (1e-5) to avoid false negatives due to floating-point or rounding artifacts. A PASS result means all matched items align within tolerance for all above fields. A FAIL result lists per-field differences for each mismatched item.
+
+### Sample Output Block
+```
+MENU / ITEM DETAILS CONSISTENCY
+==================================================
+   Overall Status: PASS
+   Items Compared: 2
+
+   DETAILED FIELD COMPARISON:
+   -----------------------------------------------
+
+   📦 Item: Plain Croissant BK (ID: 684b3616ad3fcd0dd6221f6b)
+      ✅ qty                 : menu=       2 | item=       2 | delta=       0
+      ✅ unitPrice           : menu= 75.00000 | item= 75.00000 | delta=  0.00000
+      ✅ grossAmount         : menu=150.00000 | item=150.00000 | delta=  0.00000
+      ✅ taxExclusiveUnitPrice: menu= 65.78947 | item= 65.78947 | delta=  0.00000
+      ✅ discountAmount      : menu=  0.00000 | item=  0.00000 | delta=  0.00000
+      ✅ taxExclusiveDiscountAmount: menu=  0.00000 | item=  0.00000 | delta=  0.00000
+      ✅ taxAmount           : menu= 18.42105 | item= 18.42105 | delta=  0.00000
+      ✅ netAmount           : menu=131.57894 | item=131.57894 | delta=  0.00000
+      ✅ totalPrice          : menu=150.00000 | item=150.00000 | delta=  0.00000
+```
+
+Example failure output:
+```
+MENU / ITEM DETAILS CONSISTENCY
+==================================================
+   Overall Status: FAIL
+   Items Compared: 2
+
+   DETAILED FIELD COMPARISON:
+   -----------------------------------------------
+
+   📦 Item: Plain Croissant BK (ID: 684b3616ad3fcd0dd6221f6b)
+      ✅ qty                 : menu=       2 | item=       2 | delta=       0
+      ❌ unitPrice           : menu= 75.00000 | item= 76.00000 | delta= -1.00000
+      ❌ grossAmount         : menu=150.00000 | item=152.00000 | delta= -2.00000
+      ✅ taxExclusiveUnitPrice: menu= 65.78947 | item= 65.78947 | delta=  0.00000
+      ❌ discountAmount      : menu=  0.00000 | item=  5.00000 | delta= -5.00000
+      ✅ taxExclusiveDiscountAmount: menu=  0.00000 | item=  0.00000 | delta=  0.00000
+      ❌ taxAmount           : menu= 18.42105 | item= 20.00000 | delta= -1.57895
+      ✅ netAmount           : menu=131.57894 | item=131.57894 | delta=  0.00000
+      ✅ totalPrice          : menu=150.00000 | item=150.00000 | delta=  0.00000
+```
+
+### Interpretation
+- PASS: Data alignment is reliable for audited fields (good indicator upstream transformations preserved pricing integrity).
+- FAIL: Investigate pipeline stages (promotion allocation, tax pre-processing, settlement normalization) for transformation drift.
+- Empty: If either `menuDetails` or `itemDetails` is missing/empty, the check is skipped and reported as not applicable.
+
+### Current Scope Limitations
+Additional validations that could be added (future roadmap):
+- Modifier / nested `extraDetails` reconciliation
+- Aggregated discount allocation correctness across multiple discount types
+- Cross-check of recomputed tax per line against stored `taxAmount` using different tax calculation methods
+- Configurable tolerance or strict rounding mode selection
+- Currency conversion consistency checks
+
+### Planned Enhancements (Optional)
+Potential upcoming improvements (based on requirements):
+- Extended mode flag (e.g., `--extended-consistency`) to include tax & gross/net comparisons
+- JSON output embedding a structured `consistency` object (for automation/reporting)
+- Modifier-level drilldown with hierarchical difference reporting
+- Anomaly codes (e.g., `CONSIST_DIFF_UNIT_PRICE`, `CONSIST_MISSING_ITEM`) for analytics
+- Configurable numeric tolerance via CLI (`--tolerance 0.0001`) or environment variable
+
+### Why It Matters
+Ensuring internal structural consistency reduces downstream reconciliation issues and prevents subtle taxation/reporting discrepancies caused by diverging data sources used by finance, settlements, or BI pipelines.
+
+If you would like to extend this verification to additional monetary/tax fields or enable JSON output for machine consumption, open an issue or contribute a pull request.
+
+

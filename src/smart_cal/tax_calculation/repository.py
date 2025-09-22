@@ -13,10 +13,18 @@ logger = get_logger(__name__)
 
 
 class OrderRepository:
-    def __init__(self, url: Optional[str] = None, db_name: Optional[str] = None, collection: Optional[str] = None) -> None:
+    def __init__(self, url: Optional[str] = None, db_name: Optional[str] = None, collection: Optional[str] = None, connection_url_env_key: Optional[str] = None) -> None:
         # Load config with .env file explicitly
         config = Config(".env")
-        self._url = url or config.get("mongo_url")
+        
+        # Determine connection URL based on environment-specific key if provided
+        if connection_url_env_key:
+            # Get the environment-specific URL directly from os.environ
+            import os
+            self._url = os.getenv(connection_url_env_key) or config.get("mongo_url")
+        else:
+            self._url = url or config.get("mongo_url")
+            
         self._db = db_name or config.get("mongo_db")
         self._collection = collection or config.get("mongo_collection")
         if not self._url:

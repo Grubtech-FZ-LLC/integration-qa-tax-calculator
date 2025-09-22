@@ -6,7 +6,7 @@ stored in MongoDB databases. Supports staging and production environments.
 """
 
 __version__ = "0.1.0"
-__author__ = "Integration QA Team"
+__author__ = "Dinuka Abeysinghe"
 __email__ = "integration-qa@grubtech.com"
 
 # Import main modules for CLI functionality
