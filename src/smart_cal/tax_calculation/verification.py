@@ -616,7 +616,9 @@ class OrderTaxVerifier:
         
         # Compare menuDetails vs itemDetails consistency
         menu_item_consistency = self._compare_menu_and_item_details(order_data)
-        
+        # Validate charges
+        charges_validation = self._validate_charges(order_data)
+
         summary = {
             "total_taxes": len(comparisons),
             "mismatches": sum(1 for c in comparisons if not c["is_matching"]),
@@ -633,8 +635,132 @@ class OrderTaxVerifier:
                 "discount_warning": discount_validation["warning"]
             },
             "menu_calculations_validation": menu_calculations_validation,
-            "menu_item_consistency": menu_item_consistency
+            "menu_item_consistency": menu_item_consistency,
+            "charges_validation": charges_validation
         }
+
+        # -----------------------------------------------------------------
+        # Enhanced per-tax reconciliation data for CLI aggregated view
+        # -----------------------------------------------------------------
+        try:
+            payment_tax_amount = 0.0
+            payment_details = order_data.get("paymentDetails", {}) or {}
+            price_details = payment_details.get("priceDetails", {}) or {}
+            if price_details:
+                payment_tax_amount = float(price_details.get("taxAmount", 0.0) or 0.0)
+
+            # Maps
+            menu_tax_by_id = {c["tax_id"]: round(c["menu_sum"], 5) for c in comparisons}
+            recomputed_tax_by_id = {c["tax_id"]: round(c["recomputed"], 5) for c in comparisons}
+
+            order_tax_by_id = {}
+            for ot in order_data.get("orderTaxes", []) or []:
+                raw_id = ot.get("_id") or ot.get("taxId")
+                if raw_id is None:
+                    continue
+                oid = str(raw_id)
+                amt = float(ot.get("amount", ot.get("taxAmount", ot.get("value", 0.0))) or 0.0)
+                order_tax_by_id[oid] = round(amt, 5)
+
+            charges_tax_by_id = {}
+            if charges_validation and isinstance(charges_validation.get("charge_tax_by_id"), dict):
+                charges_tax_by_id = dict(charges_validation.get("charge_tax_by_id"))
+
+            all_tax_ids = set(menu_tax_by_id.keys()) | set(order_tax_by_id.keys()) | set(charges_tax_by_id.keys())
+            tax_reconciliation: List[Dict[str, Any]] = []
+            tolerance = 1e-5
+            for tid in sorted(all_tax_ids):
+                menu_val = menu_tax_by_id.get(tid, 0.0)
+                order_val = order_tax_by_id.get(tid, 0.0)
+                recomputed_val = recomputed_tax_by_id.get(tid, 0.0)
+                charges_val = charges_tax_by_id.get(tid, 0.0)
+                combined_val = round(menu_val + charges_val, 5)
+                variance_menu_order = round(menu_val - order_val, 5)
+                variance_combined_order = round(combined_val - order_val, 5)
+                variance_menu_recomputed = round(menu_val - recomputed_val, 5)
+
+                # Try to get rate from comparisons or orderTaxes
+                rate = None
+                for c in comparisons:
+                    if c["tax_id"] == tid:
+                        rate = c.get("rate")
+                        break
+                if rate is None:
+                    # fallback from orderTaxes
+                    for ot in order_data.get("orderTaxes", []) or []:
+                        raw_id = ot.get("_id") or ot.get("taxId")
+                        if str(raw_id) == tid:
+                            rate = float(ot.get("rate", ot.get("taxRate", 0.0)) or 0.0)
+                            break
+                if rate is None:
+                    rate = 0.0
+
+                tax_reconciliation.append({
+                    "tax_id": tid,
+                    "rate": rate,
+                    "menu_tax": menu_val,
+                    "charges_tax": charges_val,
+                    "combined_menu_charges": combined_val,
+                    "order_tax": order_val,
+                    "recomputed_menu_tax": recomputed_val,
+                    "variance_menu_vs_order": variance_menu_order,
+                    "variance_combined_vs_order": variance_combined_order,
+                    "variance_menu_vs_recomputed": variance_menu_recomputed,
+                    "flags": {
+                        "menu_order_match": abs(variance_menu_order) <= tolerance,
+                        "combined_order_match": abs(variance_combined_order) <= tolerance,
+                        "menu_recomputed_match": abs(variance_menu_recomputed) <= tolerance,
+                    }
+                })
+
+            missing_in_order = [tid for tid in (set(menu_tax_by_id.keys()) | set(charges_tax_by_id.keys())) if tid not in order_tax_by_id]
+            order_only = [tid for tid in order_tax_by_id.keys() if tid not in menu_tax_by_id and tid not in charges_tax_by_id]
+
+            summary.update({
+                "payment_tax_amount": round(payment_tax_amount, 5),
+                "menu_tax_by_id": menu_tax_by_id,
+                "order_tax_by_id": order_tax_by_id,
+                "recomputed_tax_by_id": recomputed_tax_by_id,
+                "charges_tax_by_id": charges_tax_by_id,
+                "tax_reconciliation": tax_reconciliation,
+                "tax_anomalies": {
+                    "missing_in_order": missing_in_order,
+                    "order_only": order_only
+                }
+            })
+        except Exception:
+            # Fail silently—aggregated view is supplementary
+            pass
+        # Surface commonly requested top-level metadata (non-sensitive) into summary for CLI convenience
+        # Attempt to capture foodAggragetorId if present anywhere typical (root or under paymentDetails/aggregator fields)
+        possible_food_agg_keys = [
+            "foodAggragetorId",  # as requested (note: keep original spelling if that's how it appears in DB)
+            "foodAggregatorId",  # common spelling variant
+            "aggregatorId",
+            "foodAggregatorID",
+        ]
+        food_agg_val = None
+        for k in possible_food_agg_keys:
+            if k in order_data and order_data.get(k) not in (None, ""):
+                food_agg_val = order_data.get(k)
+                break
+        # Fallback: look into paymentDetails or metadata containers if not found at root
+        if food_agg_val is None:
+            payment_details = order_data.get("paymentDetails") or {}
+            for k in possible_food_agg_keys:
+                if k in payment_details and payment_details.get(k) not in (None, ""):
+                    food_agg_val = payment_details.get(k)
+                    break
+        if food_agg_val is None:
+            meta = order_data.get("metadata") or {}
+            if isinstance(meta, dict):
+                for k in possible_food_agg_keys:
+                    if k in meta and meta.get(k) not in (None, ""):
+                        food_agg_val = meta.get(k)
+                        break
+        if food_agg_val is not None:
+            summary["foodAggragetorId"] = str(food_agg_val)
+
         return {"comparisons": comparisons, "summary": summary}
 
     # ---------------------------------------------------------------------
@@ -667,14 +793,41 @@ class OrderTaxVerifier:
         """
         
         menu_items = order_data.get("menuDetails") or []
-        order_taxes = {tax.get("_id"): tax for tax in order_data.get("orderTaxes", [])}
+        # Normalize orderTaxes keys to string for consistent lookup (items/modifiers/charges may hold ObjectId or string)
+        order_taxes = {str(tax.get("_id")): tax for tax in order_data.get("orderTaxes", [])}
+
+        # Pre-compute aggregates used for proportional distribution (Pattern 4)
+        total_menu_gross = 0.0
+        total_item_level_discount_sum = 0.0  # Inclusive, items + modifiers (modifiers multiplied by parent qty)
+        total_item_level_tax_excl_discount_sum = 0.0
+        total_tax_exclusive_gross_sum = 0.0
+        for _mi in menu_items:
+            _p = (_mi.get("price") or {})
+            qty_tmp = _mi.get("qty", 1) or 1
+            gross_tmp = float(_p.get("grossAmount", 0.0))
+            total_menu_gross += gross_tmp
+            # Add item discount
+            total_item_level_discount_sum += float(_p.get("discountAmount", 0.0))
+            # Add modifier discounts (each modifier discount multiplied by parent item qty like in _get_total_item_level_discounts)
+            for _mod in _mi.get("extraDetails", []) or []:
+                _mp = (_mod.get("price") or {})
+                mod_disc = float(_mp.get("discountAmount", 0.0) or 0.0)
+                if mod_disc:
+                    total_item_level_discount_sum += mod_disc * qty_tmp
+            total_item_level_tax_excl_discount_sum += float(_p.get("taxExclusiveDiscountAmount", 0.0))
+            tax_excl_unit_tmp = float(_p.get("taxExclusiveUnitPrice", 0.0))
+            total_tax_exclusive_gross_sum += tax_excl_unit_tmp * qty_tmp
         
         # Check discount pattern context for better error reporting
         has_item_discounts = self._has_item_level_discounts(order_data)
         order_discount = self._get_order_level_discount(order_data)
         
         if has_item_discounts and order_discount > 0:
-            discount_context = "Pattern 4: Combined Discounts"
+            # Reclassification: If order discount approximately equals sum of item+modifier discounts (within 5%), treat as Pattern 3
+            if total_item_level_discount_sum > 0 and abs(order_discount - total_item_level_discount_sum) / total_item_level_discount_sum < 0.05:
+                discount_context = "Pattern 3: Item-Level Discounts Only"
+            else:
+                discount_context = "Pattern 4: Combined Discounts"
         elif has_item_discounts:
             discount_context = "Pattern 3: Item-Level Discounts Only"
         elif order_discount > 0:
@@ -686,7 +839,64 @@ class OrderTaxVerifier:
         calculation_errors = []
         total_items = 0
         
-        def validate_price_object(item_data, item_type="item", parent_qty=1):
+        # ------------------------------------------------------------------
+        # Precompute Pattern 4 two-stage allocation (exclusive discounts):
+        #   1. Remove item-level exclusive discount per line (items + modifiers)
+        #   2. Allocate residual order-level exclusive discount proportionally
+        #      to the post-item-discount exclusive bases.
+        # This mapping will be used only for netAmount expectations in Pattern 4.
+        # ------------------------------------------------------------------
+        pattern4_allocation_map = {}
+        if 'Pattern 4' in locals().get('discount_context', ''):
+            try:
+                payment_details = order_data.get("paymentDetails", {}) or {}
+                price_details = payment_details.get("priceDetails", {}) or {}
+                global_tax_excl_discount_total = float(price_details.get("taxExclusiveDiscountAmount", 0) or 0.0)
+
+                allocation_entries = []  # list of (key, post_item_exclusive_base)
+                sum_item_exclusive_discounts = 0.0
+
+                def _get_id(obj):
+                    return str(obj.get("internalId") or obj.get("_id") or obj.get("id") or obj.get("name") or "UNK")
+
+                for _item in menu_items:
+                    _ip = (_item.get("price") or {})
+                    _qty = int(_item.get("qty", 1) or 1)
+                    excl_unit = float(_ip.get("taxExclusiveUnitPrice", 0.0) or 0.0)
+                    excl_discount = float(_ip.get("taxExclusiveDiscountAmount", 0.0) or 0.0)
+                    exclusive_gross = excl_unit * _qty
+                    post_item_excl = exclusive_gross - excl_discount
+                    item_key = _get_id(_item)
+                    allocation_entries.append((item_key, post_item_excl))
+                    sum_item_exclusive_discounts += excl_discount
+
+                    # modifiers
+                    for _mod in _item.get("extraDetails", []) or []:
+                        _mp = (_mod.get("price") or {})
+                        mod_excl_unit = float(_mp.get("taxExclusiveUnitPrice", 0.0) or 0.0)
+                        mod_qty = int(_mod.get("qty", 1) or 1)
+                        mod_excl_discount = float(_mp.get("taxExclusiveDiscountAmount", 0.0) or 0.0)
+                        # modifier total exclusive gross multiplied by parent qty
+                        mod_exclusive_gross = mod_excl_unit * mod_qty * _qty
+                        post_mod_excl = mod_exclusive_gross - (mod_excl_discount * _qty)
+                        mod_key = f"{item_key}||mod||{_get_id(_mod)}"
+                        allocation_entries.append((mod_key, post_mod_excl))
+                        sum_item_exclusive_discounts += (mod_excl_discount * _qty)
+
+                residual_exclusive = max(0.0, global_tax_excl_discount_total - sum_item_exclusive_discounts)
+                total_post_item_excl = sum(val for _, val in allocation_entries)
+                if total_post_item_excl > 0 and residual_exclusive > 0:
+                    for k, base_val in allocation_entries:
+                        pattern4_allocation_map[k] = residual_exclusive * (base_val / total_post_item_excl)
+                else:
+                    # no residual or zero base -> all zero allocations
+                    for k, _ in allocation_entries:
+                        pattern4_allocation_map[k] = 0.0
+            except Exception:
+                # Fallback: leave map empty (safe degradation)
+                pattern4_allocation_map = {}
+
+        def validate_price_object(item_data, item_type="item", parent_qty=1, parent_internal_id=None):
             """Helper to validate a single price object (item or modifier) with pattern awareness"""
             nonlocal total_items, validation_details, calculation_errors
             
@@ -703,6 +913,7 @@ class OrderTaxVerifier:
             gross_amount = float(price.get("grossAmount", 0))
             tax_exclusive_unit_price = float(price.get("taxExclusiveUnitPrice", 0))
             discount_amount = float(price.get("discountAmount", 0))
+            original_item_discount_amount = discount_amount  # preserve original (item-level) discount for pattern checks
             tax_exclusive_discount_amount = float(price.get("taxExclusiveDiscountAmount", 0))
             tax_amount = float(price.get("taxAmount", 0))
             net_amount = float(price.get("netAmount", 0))
@@ -711,10 +922,19 @@ class OrderTaxVerifier:
             # Calculate tax rate from taxes array first
             total_tax_rate = 0.0
             for tax_entry in taxes:
-                tax_id = tax_entry.get("taxId")
+                raw_tax_id = tax_entry.get("taxId") or tax_entry.get("_id")
+                tax_id = str(raw_tax_id)
+                tax_rate_val = None
                 if tax_id in order_taxes:
-                    tax_rate = float(order_taxes[tax_id].get("rate", 0))
-                    total_tax_rate += tax_rate
+                    tax_rate_val = order_taxes[tax_id].get("rate")
+                # Fallback: sometimes rate may already be embedded in the tax entry
+                if tax_rate_val is None:
+                    tax_rate_val = tax_entry.get("rate")
+                if tax_rate_val is not None:
+                    try:
+                        total_tax_rate += float(tax_rate_val)
+                    except (TypeError, ValueError):
+                        pass
             
             # If no tax rate found in taxes array, derive it from price relationships
             if total_tax_rate == 0.0 and tax_exclusive_unit_price > 0 and unit_price > tax_exclusive_unit_price:
@@ -728,12 +948,57 @@ class OrderTaxVerifier:
             is_taxed = (tax_amount > 0.0 or tax_exclusive_unit_price != unit_price or total_tax_rate > 0.0)
             
             if not is_taxed:
-                # Tax-free item logic (same for all patterns)
+                # Tax-free item logic (pattern-aware for net & totalPrice)
                 expected_tax_exclusive_unit_price = unit_price
                 expected_tax_exclusive_discount = discount_amount
                 expected_tax_amount = 0.0
-                expected_net_amount = gross_amount - discount_amount
-                expected_total_price = gross_amount
+
+                # Pattern-aware net amount for non-taxed items mirrors exclusive logic
+                if "Pattern 4" in discount_context:
+                    # Two-stage residual (exclusive == inclusive for tax-free)
+                    payment_details = order_data.get("paymentDetails", {}) or {}
+                    price_details = payment_details.get("priceDetails", {}) or {}
+                    global_discount_total = float(price_details.get("discountAmount", 0) or 0.0)
+                    # residual inclusive discount = global - sum item-level
+                    residual_inclusive = max(global_discount_total - total_item_level_discount_sum, 0.0)
+                    # Allocate residual over post-item-discount bases
+                    post_item_base_total = 0.0
+                    if residual_inclusive > 0:
+                        for _it in menu_items:
+                            _ip = (_it.get("price") or {})
+                            _g = float(_ip.get("grossAmount", 0.0) or 0.0)
+                            _d = float(_ip.get("discountAmount", 0.0) or 0.0)
+                            post_item_base_total += max(_g - _d, 0.0)
+                    allocated_residual = 0.0
+                    if residual_inclusive > 0:
+                        if post_item_base_total > 0:
+                            allocated_residual = residual_inclusive * (max(gross_amount - discount_amount, 0.0) / post_item_base_total)
+                        else:
+                            allocated_residual = residual_inclusive * (gross_amount / total_menu_gross) if total_menu_gross > 0 else 0.0
+                    post_item_base = gross_amount - discount_amount
+                    expected_net_amount = post_item_base - allocated_residual
+                elif "Pattern 3" in discount_context:
+                    expected_net_amount = gross_amount - discount_amount
+                elif "Pattern 2" in discount_context:
+                    payment_details = order_data.get("paymentDetails", {}) or {}
+                    price_details = payment_details.get("priceDetails", {}) or {}
+                    global_discount_total = float(price_details.get("discountAmount", 0) or 0.0)
+                    global_unit_total = float(price_details.get("unitPrice", 0) or 0.0)
+                    if global_unit_total > 0 and global_discount_total > 0:
+                        proportion = global_discount_total / global_unit_total
+                        weighted_disc = proportion * gross_amount
+                        expected_net_amount = gross_amount - weighted_disc
+                    else:
+                        expected_net_amount = gross_amount - discount_amount
+                else:  # Pattern 1
+                    expected_net_amount = gross_amount - discount_amount
+
+                # totalPrice should always reflect discount for discounted tax-free items
+                expected_total_price = gross_amount - discount_amount
+                if discount_amount == 0:
+                    total_price_formula = f"grossAmount({gross_amount}) (tax-free, no discounts)"
+                else:
+                    total_price_formula = f"grossAmount({gross_amount}) - discountAmount({discount_amount}) (tax-free)"
             else:
                 # Tax-inclusive item logic with pattern awareness
                 if tax_rate_decimal > 0:
@@ -743,46 +1008,100 @@ class OrderTaxVerifier:
                     expected_tax_exclusive_unit_price = tax_exclusive_unit_price
                     expected_tax_exclusive_discount = tax_exclusive_discount_amount
                 
-                # Calculate expected tax amount based on pattern
+                # Calculate expected tax amount base (taxable_amount) with pattern-aware discount composition
+                payment_details = order_data.get("paymentDetails", {}) or {}
+                price_details = payment_details.get("priceDetails", {}) or {}
+                global_unit_price = float(price_details.get("unitPrice", 0))
+                global_discount_inclusive = float(price_details.get("discountAmount", 0))  # total (item + order) inclusive discount
+                global_tax_excl_discount_total = float(price_details.get("taxExclusiveDiscountAmount", 0))
+
                 if "Pattern 1" in discount_context:
-                    # No discounts: tax calculated on full gross amount
                     taxable_amount = gross_amount
                 elif "Pattern 2" in discount_context:
-                    # Order-level discount: Database values may reflect distributed discount
-                    # For validation, we expect the actual stored taxAmount to be correct
-                    # as it already accounts for the discount distribution
-                    taxable_amount = gross_amount - discount_amount  # This may not match if order discount was distributed
+                    # Order-level only: proportional on gross
+                    proportion = (global_discount_inclusive / global_unit_price) if (global_unit_price > 0 and global_discount_inclusive > 0) else 0.0
+                    weighted_discount_inclusive = proportion * gross_amount
+                    taxable_amount = gross_amount - weighted_discount_inclusive
                 elif "Pattern 3" in discount_context:
-                    # Item-level discount only: tax calculated after item discount
+                    # Item-level only
                     taxable_amount = gross_amount - discount_amount
                 elif "Pattern 4" in discount_context:
-                    # Combined discounts: complex calculation, database values should be trusted more
-                    taxable_amount = gross_amount - discount_amount
+                    # Combined: item-level + allocated order-level share (inclusive)
+                    # Unified residual allocation: denominator = global_unit_price - total_item_level_discount_sum.
+                    # This represents the post-item-discount tax-inclusive base across all lines (items + modifiers).
+                    order_level_inclusive_component = max(global_discount_inclusive - total_item_level_discount_sum, 0.0)
+                    allocated_order_inclusive_share = 0.0
+                    if order_level_inclusive_component > 0:
+                        denom_post_item_discount = max(global_unit_price - total_item_level_discount_sum, 0.0)
+                        if denom_post_item_discount > 0:
+                            allocated_order_inclusive_share = order_level_inclusive_component * (max(gross_amount - discount_amount, 0.0) / denom_post_item_discount)
+                        elif total_menu_gross > 0:
+                            # Fallback: gross-based
+                            allocated_order_inclusive_share = order_level_inclusive_component * (gross_amount / total_menu_gross)
+                    combined_inclusive_discount = discount_amount + allocated_order_inclusive_share
+                    taxable_amount = gross_amount - combined_inclusive_discount
                 else:
-                    # Default case
                     taxable_amount = gross_amount - discount_amount
                 
-                # Calculate expected tax amount
+                # Calculate expected tax amount using inclusive-tax reverse calculation
                 if tax_rate_decimal > 0:
                     expected_tax_amount = taxable_amount - (taxable_amount / (1.0 + tax_rate_decimal))
                 else:
                     expected_tax_amount = 0.0
                 
                 expected_tax_exclusive_gross = expected_tax_exclusive_unit_price * qty
-                expected_net_amount = expected_tax_exclusive_gross - expected_tax_exclusive_discount
+
+                # Initialize flag before weighted logic (avoid UnboundLocalError for Pattern 1 / tax-free cases)
+                weighted_discount_used = False
+
+                # Net Amount expectation logic by pattern:
+                # Pattern 1: No discounts -> net = taxExclusiveGross (since no discount)
+                # Pattern 2: Order-level only -> retain weighted distribution (global ratio) across items
+                # Pattern 3: Item-level only -> net = taxExclusiveGross - taxExclusiveDiscountAmount (no global weighting)
+                # Pattern 4: Combined -> apply global weighting (captures effect of both levels)
+                global_tex_unit = float(price_details.get("taxExclusiveUnitPrice", 0))
+                global_tex_discount = global_tax_excl_discount_total
+
+                # Build a stable key for Pattern 4 allocation map lookup
+                if item_type == 'modifier':
+                    parent_key_part = str(parent_internal_id or 'PARENT')
+                    key_lookup = f"{parent_key_part}||mod||{item_id}"
+                else:
+                    key_lookup = str(item_id)
+
+                if "Pattern 4" in discount_context:
+                    # Two-stage allocation: net = (taxExclGross - itemExclDiscount) - allocatedResidualOrderExcl
+                    post_item_excl = expected_tax_exclusive_gross - expected_tax_exclusive_discount
+                    allocated_residual = pattern4_allocation_map.get(key_lookup, 0.0)
+                    expected_net_amount = post_item_excl - allocated_residual
+                    weighted_discount_used = True  # mark to explain formula
+                elif "Pattern 3" in discount_context:
+                    expected_net_amount = expected_tax_exclusive_gross - expected_tax_exclusive_discount
+                elif "Pattern 2" in discount_context:
+                    # order-level only -> global proportional exclusive weighting
+                    if global_tex_unit > 0 and global_tex_discount > 0:
+                        proportion_tex = global_tex_discount / global_tex_unit
+                        weighted_item_discount_tex = proportion_tex * expected_tax_exclusive_unit_price * qty
+                        expected_net_amount = expected_tax_exclusive_gross - weighted_item_discount_tex
+                        weighted_discount_used = True
+                    else:
+                        expected_net_amount = expected_tax_exclusive_gross - expected_tax_exclusive_discount
+                else:  # Pattern 1
+                    expected_net_amount = expected_tax_exclusive_gross - expected_tax_exclusive_discount
                 # Pattern-aware expected totalPrice
-                if "Pattern 1" in discount_context and discount_amount == 0:
-                    expected_total_price = gross_amount
+                # Clarified rule: totalPrice always unitPrice*qty - discountAmount (regardless of pattern).
+                expected_total_price = gross_amount - discount_amount
+                if discount_amount == 0:
                     total_price_formula = f"grossAmount({gross_amount}) (no discounts)"
                 else:
-                    expected_total_price = gross_amount - discount_amount
                     total_price_formula = f"grossAmount({gross_amount}) - discountAmount({discount_amount})"
             
-            # For Pattern 2 and Pattern 4, relax validation for tax and net amounts
-            # as they may legitimately differ due to discount distribution
+            # For Pattern 2 and Pattern 4, relax validation for netAmount only (not taxAmount)
+            # Previously both taxAmount and netAmount were relaxed which masked real tax variances.
             pattern_adjusted_tolerance = tolerance
             if "Pattern 2" in discount_context or "Pattern 4" in discount_context:
-                pattern_adjusted_tolerance = max(tolerance, 1.0)  # Allow up to $1 difference for discount-affected fields
+                pattern_adjusted_tolerance = max(tolerance, 1.0)  # Allow up to $1 difference for net amount variance due to distribution
+            tax_strict_tolerance = tolerance  # Always enforce strict tolerance for taxAmount
             
             # Validate calculations with pattern-aware tolerance
             item_validation = {
@@ -802,10 +1121,14 @@ class OrderTaxVerifier:
                  f"unitPrice({unit_price})" if not is_taxed else f"unitPrice({unit_price}) ÷ (1 + {tax_rate_decimal:.5f}) = {expected_tax_exclusive_unit_price:.5f}", tolerance),
                 ("taxExclusiveDiscountAmount", tax_exclusive_discount_amount, expected_tax_exclusive_discount,
                  f"discountAmount({discount_amount})" if not is_taxed else f"discountAmount({discount_amount}) ÷ (1 + {tax_rate_decimal:.5f})", tolerance),
-                ("taxAmount", tax_amount, expected_tax_amount, 
-                 "0.0 (tax-free)" if not is_taxed else f"taxable_amount - (taxable_amount ÷ (1 + {tax_rate_decimal:.5f})) = {expected_tax_amount:.5f}", pattern_adjusted_tolerance),
-                ("netAmount", net_amount, expected_net_amount, 
-                 f"grossAmount({gross_amount}) - discountAmount({discount_amount})" if not is_taxed else f"tax-exclusive amount after discounts = {expected_net_amount:.5f}", pattern_adjusted_tolerance),
+                ("taxAmount", tax_amount, expected_tax_amount,
+                 "0.0 (tax-free)" if not is_taxed else f"taxable_amount - (taxable_amount ÷ (1 + {tax_rate_decimal:.5f})) = {expected_tax_amount:.5f}", tax_strict_tolerance),
+                                ("netAmount", net_amount, expected_net_amount,
+                                (f"grossAmount({gross_amount}) - discountAmount({discount_amount})" if not is_taxed else 
+                                    (f"Two-stage (P4 net): (taxExclGross - itemExclDisc) - allocatedResidual = {expected_net_amount:.5f}" if ("Pattern 4" in discount_context) else
+                                     (f"(weighted) taxExclGross({expected_tax_exclusive_gross:.5f}) - proportion * taxExclGross = {expected_net_amount:.5f}" if weighted_discount_used else
+                                      f"taxExclusiveUnitPrice*qty({expected_tax_exclusive_gross:.5f}) - taxExclusiveDiscountAmount({tax_exclusive_discount_amount})"))),
+                                 pattern_adjusted_tolerance),
                 ("totalPrice", total_price, expected_total_price, total_price_formula, tolerance),
             ]
             
@@ -903,6 +1226,192 @@ class OrderTaxVerifier:
                    "discount application (item discounts first, then order discount distribution).")
         
         return f"Some price calculations are mathematically inconsistent! ({discount_context})"
+
+    # ---------------------------------------------------------------------
+    # Charges validation
+    # ---------------------------------------------------------------------
+    def _validate_charges(self, order_data: Dict[str, Any], tolerance: float = 1e-5) -> Dict[str, Any]:
+        """Validate invoice-included charges integration with order totals and taxes.
+
+        Checks:
+        1. Only charges with includeInInvoice == True are included in recomputed total.
+           expected_total = unitPrice - discountAmount + sum(invoice_charge.amount)
+        2. paymentDetails.priceDetails.totalPrice matches expected_total (within tolerance).
+        3. paymentDetails.priceDetails.taxAmount == sum(orderTaxes.amount).
+        4. For each charge's taxId, ensure it exists in orderTaxes and charge tax does not exceed orderTax amount.
+        5. Charge internal consistency: taxExclusiveAmount + tax == amount and tax == sum(charge.taxes.amount).
+        6. Aggregate charge tax per taxId and compare to orderTaxes amounts (exact_match & within_order_tax flags).
+        """
+        payment_details = order_data.get("paymentDetails", {})
+        price_details = payment_details.get("priceDetails", {})
+        charges = payment_details.get("charges", []) or []
+        order_taxes = order_data.get("orderTaxes", []) or []
+
+        unit_price = float(price_details.get("unitPrice", 0.0) or 0.0)
+        discount_amount = float(price_details.get("discountAmount", 0.0) or 0.0)
+        stored_total_price = float(price_details.get("totalPrice", 0.0) or 0.0)
+        stored_tax_amount = float(price_details.get("taxAmount", 0.0) or 0.0)
+
+        invoice_charges = [c for c in charges if c.get("includeInInvoice")]
+        sum_invoice_charge_amounts = 0.0
+        charge_entries = []
+        charge_tax_by_id: Dict[str, float] = {}
+        charge_validation_errors = []
+
+        for ch in invoice_charges:
+            amount = float(ch.get("amount", 0.0) or 0.0)
+            tax_component = float(ch.get("tax", 0.0) or 0.0)
+            tax_exclusive_amount = float(ch.get("taxExclusiveAmount", 0.0) or 0.0)
+            taxes_list = ch.get("taxes", []) or []
+            sum_invoice_charge_amounts += amount
+            sum_list_tax = sum(float(t.get("amount", 0.0) or 0.0) for t in taxes_list)
+
+            internal_ok = True
+            if abs(sum_list_tax - tax_component) > tolerance:
+                internal_ok = False
+                charge_validation_errors.append({
+                    "type": ch.get("type"),
+                    "issue": "charge_tax_mismatch",
+                    "message": f"Charge tax field {tax_component:.5f} != sum(taxes.amount) {sum_list_tax:.5f}"
+                })
+            if abs((tax_exclusive_amount + tax_component) - amount) > tolerance:
+                internal_ok = False
+                charge_validation_errors.append({
+                    "type": ch.get("type"),
+                    "issue": "charge_amount_inconsistent",
+                    "message": f"taxExclusiveAmount + tax != amount ({tax_exclusive_amount:.5f} + {tax_component:.5f} != {amount:.5f})"
+                })
+
+            # Capture involved taxIds for recomputation
+            tax_ids_in_charge = []
+            for t in taxes_list:
+                raw_tid = t.get("taxId") or t.get("_id")
+                tax_amt = float(t.get("amount", 0.0) or 0.0)
+                if raw_tid is not None:
+                    tax_id = str(raw_tid)
+                    tax_ids_in_charge.append(tax_id)
+                    charge_tax_by_id.setdefault(tax_id, 0.0)
+                    charge_tax_by_id[tax_id] += tax_amt
+
+            # Recompute tax for single-tax charges using inclusive formula: tax = amount - amount/(1+rate)
+            recomputed_tax = None
+            recomputed_ok = None
+            applied_rate = None
+            if len(tax_ids_in_charge) == 1:
+                tid = tax_ids_in_charge[0]
+                # find rate in order_taxes
+                for ot in order_taxes:
+                    ot_id = str(ot.get("_id") or ot.get("taxId")) if (ot.get("_id") or ot.get("taxId")) else None
+                    if ot_id == tid:
+                        applied_rate = float(ot.get("rate", ot.get("taxRate", 0.0)) or 0.0)
+                        break
+                if applied_rate is not None:
+                    recomputed_tax = amount - (amount / (1 + applied_rate/100.0))
+                    recomputed_tax = round(recomputed_tax, 5)
+                    recomputed_ok = abs(recomputed_tax - tax_component) <= tolerance
+                    if recomputed_ok is False:
+                        internal_ok = False
+                        charge_validation_errors.append({
+                            "type": ch.get("type"),
+                            "issue": "charge_tax_recompute_mismatch",
+                            "message": f"Recomputed tax {recomputed_tax:.5f} differs from stored tax {tax_component:.5f} (rate {applied_rate:.2f}%)"
+                        })
+
+            charge_entries.append({
+                "type": ch.get("type"),
+                "amount": amount,
+                "tax": tax_component,
+                "taxExclusiveAmount": tax_exclusive_amount,
+                "sum_list_tax": sum_list_tax,
+                "internal_ok": internal_ok,
+                "includeInInvoice": True,
+                "taxes": taxes_list,
+                "recomputed_tax": recomputed_tax,
+                "recomputed_tax_match": recomputed_ok,
+                "applied_rate": applied_rate,
+            })
+
+        expected_total = unit_price - discount_amount + sum_invoice_charge_amounts
+        total_ok = abs(expected_total - stored_total_price) <= tolerance
+
+        sum_order_taxes = sum(float(t.get("amount", 0.0) or 0.0) for t in order_taxes)
+        tax_total_ok = abs(sum_order_taxes - stored_tax_amount) <= tolerance
+
+        order_tax_map: Dict[str, float] = {}
+        for ot in order_taxes:
+            raw_id = ot.get("_id") or ot.get("taxId")
+            if raw_id is not None:
+                tax_id = str(raw_id)
+                order_tax_map[tax_id] = float(ot.get("amount", 0.0) or 0.0)
+
+        charge_tax_matches = []
+        for tax_id, charge_tax_total in charge_tax_by_id.items():
+            # ensure tax_id normalized to string for lookup
+            norm_tax_id = str(tax_id)
+            order_tax_amount = order_tax_map.get(norm_tax_id)
+            if order_tax_amount is None:
+                charge_validation_errors.append({
+                    "taxId": norm_tax_id,
+                    "issue": "charge_tax_not_in_orderTaxes",
+                    "message": f"Charge references taxId {norm_tax_id} not present in orderTaxes"
+                })
+                proportion_ok = False
+                exact_match = False
+            else:
+                proportion_ok = charge_tax_total <= order_tax_amount + tolerance
+                exact_match = abs(charge_tax_total - order_tax_amount) <= tolerance
+                if not proportion_ok:
+                    charge_validation_errors.append({
+                        "taxId": norm_tax_id,
+                        "issue": "charge_tax_exceeds_order_tax",
+                        "message": f"Charge tax {charge_tax_total:.5f} exceeds orderTax amount {order_tax_amount:.5f}"
+                    })
+            charge_tax_matches.append({
+                "taxId": norm_tax_id,
+                "charge_tax": round(charge_tax_total,5),
+                "order_tax": round(order_tax_amount if order_tax_amount is not None else 0.0,5),
+                "exact_match": exact_match,
+                "within_order_tax": proportion_ok
+            })
+
+        # If high-level reconciliations fail (total or tax) but no granular errors were recorded, add explicit reasons
+        if not total_ok and not any(e.get("issue") == "charge_total_mismatch" for e in charge_validation_errors):
+            charge_validation_errors.append({
+                "issue": "charge_total_mismatch",
+                "message": f"Expected total (unitPrice - discount + included charges) {expected_total:.5f} != stored total {stored_total_price:.5f}",
+                "expected_total": round(expected_total,5),
+                "stored_total": round(stored_total_price,5)
+            })
+        if not tax_total_ok and not any(e.get("issue") == "charge_tax_total_mismatch" for e in charge_validation_errors):
+            charge_validation_errors.append({
+                "issue": "charge_tax_total_mismatch",
+                "message": f"Sum orderTaxes {sum_order_taxes:.5f} != stored taxAmount {stored_tax_amount:.5f}",
+                "sum_order_taxes": round(sum_order_taxes,5),
+                "stored_tax_amount": round(stored_tax_amount,5)
+            })
+
+        is_valid = total_ok and tax_total_ok and not any(e.get("issue") in [
+            "charge_tax_mismatch", "charge_amount_inconsistent", "charge_tax_exceeds_order_tax", "charge_tax_not_in_orderTaxes", "charge_total_mismatch", "charge_tax_total_mismatch"
+        ] for e in charge_validation_errors)
+
+        return {
+            "is_valid": is_valid,
+            "expected_total_price": round(expected_total,5),
+            "stored_total_price": round(stored_total_price,5),
+            "total_price_match": total_ok,
+            "unit_price": unit_price,
+            "discount_amount": discount_amount,
+            "included_charges_total": round(sum_invoice_charge_amounts,5),
+            "included_charge_count": len(invoice_charges),
+            "charge_entries": charge_entries,
+            "charge_tax_by_id": {k: round(v,5) for k,v in charge_tax_by_id.items()},
+            "charge_tax_matches": charge_tax_matches,
+            "stored_tax_amount": round(stored_tax_amount,5),
+            "sum_order_taxes": round(sum_order_taxes,5),
+            "tax_total_match": tax_total_ok,
+            "errors": charge_validation_errors,
+            "tolerance": tolerance,
+        }
 
     # ---------------------------------------------------------------------
     # New integrity check: Compare menuDetails[] vs itemDetails[] (if present)
@@ -1005,12 +1514,50 @@ class OrderTaxVerifier:
         item_map = {}
         
         # Build maps for matching
+        def _get_modifiers(obj: Dict[str, Any]):
+            mods = obj.get("extraDetails")
+            if not mods:
+                mods = obj.get("modifiers")
+            return mods or []
+
         for m in menu_items:
             key = extract_key(m)
             menu_map[key] = m
+            # Also index modifiers/extraDetails with a composite key to avoid collision.
+            # Key pattern: parentKey||mod||modifierInternalId (fallback to name)
+            for mod in _get_modifiers(m):
+                mod_key_base = extract_key(m)
+                mod_id = None
+                for k in ("internalId", "_id", "id"):
+                    if k in mod and mod.get(k) not in (None, ""):
+                        mod_id = str(mod.get(k))
+                        break
+                if not mod_id:
+                    mod_id = f"NAME::{mod.get('name','')}"
+                composite_key = f"{mod_key_base}||mod||{mod_id}"
+                # Store enriched modifier object with parent linkage flags
+                mod_enriched = dict(mod)
+                mod_enriched["__is_modifier__"] = True
+                mod_enriched["__parent_key__"] = mod_key_base
+                menu_map[composite_key] = mod_enriched
         for it in item_items:
             key = extract_key(it)
             item_map[key] = it
+            # Index itemDetails modifiers if present for potential comparison
+            for mod in _get_modifiers(it):
+                mod_key_base = key
+                mod_id = None
+                for k in ("internalId", "_id", "id"):
+                    if k in mod and mod.get(k) not in (None, ""):
+                        mod_id = str(mod.get(k))
+                        break
+                if not mod_id:
+                    mod_id = f"NAME::{mod.get('name','')}"
+                composite_key = f"{mod_key_base}||mod||{mod_id}"
+                mod_enriched = dict(mod)
+                mod_enriched["__is_modifier__"] = True
+                mod_enriched["__parent_key__"] = mod_key_base
+                item_map[composite_key] = mod_enriched
 
         differences: List[Dict[str, Any]] = []
         unmatched_in_menu = 0
@@ -1039,10 +1586,24 @@ class OrderTaxVerifier:
             i_entry = item_map.get(key)
             
             if m_entry is None:
-                unmatched_in_item += 1
+                # ItemDetails has an entry not in menu; count only if not a modifier
+                if not (i_entry and i_entry.get("__is_modifier__")):
+                    unmatched_in_item += 1
                 continue
             if i_entry is None:
-                unmatched_in_menu += 1
+                # Menu has an entry not in itemDetails; ignore modifiers for mismatch tally
+                if not (m_entry and m_entry.get("__is_modifier__")):
+                    unmatched_in_menu += 1
+                # Still record standalone modifier details for visibility, but skip comparison
+                if m_entry.get("__is_modifier__"):
+                    items_detail.append({
+                        "key": key,
+                        "name": m_entry.get("name","Unknown Modifier"),
+                        "fields": {},
+                        "is_modifier": True,
+                        "parent_key": m_entry.get("__parent_key__"),
+                        "note": "Modifier exists only in menuDetails"
+                    })
                 continue
                 
             total_compared += 1
@@ -1051,7 +1612,9 @@ class OrderTaxVerifier:
             item_detail = {
                 "key": key,
                 "name": m_entry.get("name", "Unknown Item"),
-                "fields": {}
+                "fields": {},
+                "is_modifier": bool(m_entry.get("__is_modifier__")),
+                "parent_key": m_entry.get("__parent_key__") if m_entry.get("__is_modifier__") else None
             }
             
             for field_name, menu_extractor, item_extractor in fields_to_check:
@@ -1093,6 +1656,7 @@ class OrderTaxVerifier:
             
             items_detail.append(item_detail)
 
+        # Consistency ignores modifier-only presence mismatches
         is_consistent = (
             len(differences) == 0 and unmatched_in_menu == 0 and unmatched_in_item == 0
         )
@@ -1106,5 +1670,5 @@ class OrderTaxVerifier:
             "unmatched_in_item": unmatched_in_item,
             "matching_key": "identifier",
             "tolerance": tolerance,
-            "items_detail": items_detail,  # New detailed information
+            "items_detail": items_detail,  # Includes modifiers with parent linkage
         }
