@@ -12,26 +12,26 @@ install: ## Install production dependencies
 install-dev: ## Install development dependencies
 	pip install -e ".[dev]"
 
-test: ## Run tests
-	pytest tests/
+test: ## Run tests (no tests directory currently)
+	@echo "No tests directory found"
 
-test-cov: ## Run tests with coverage
-	pytest tests/ --cov=src/ --cov-report=html --cov-report=term-missing
+test-cov: ## Run tests with coverage (no tests directory currently)
+	@echo "No tests directory found"
 
-test-watch: ## Run tests in watch mode (requires pytest-watch)
-	ptw tests/
+test-watch: ## Run tests in watch mode (no tests directory currently)
+	@echo "No tests directory found"
 
 lint: ## Run linting checks
-	flake8 src/ tests/
+	flake8 src/
 	mypy src/
 
 format: ## Format code
-	black src/ tests/
-	isort src/ tests/
+	black src/
+	isort src/
 
 format-check: ## Check code formatting
-	black --check src/ tests/
-	isort --check-only src/ tests/
+	black --check src/
+	isort --check-only src/
 
 security: ## Run security checks
 	bandit -r src/

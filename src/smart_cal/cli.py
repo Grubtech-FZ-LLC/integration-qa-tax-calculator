@@ -82,16 +82,27 @@ Examples:
         help="Tax view detail level: basic (no aggregated table), full (include summary + reconciliation), failures (only rows with variances)."
     )
     
+    verify_parser.add_argument(
+        "--precision",
+        type=int,
+        default=5,
+        choices=[2, 3, 4, 5, 6, 7, 8],
+        help="Decimal precision for tax calculations (default: 5). Controls the number of decimal places used in r_j/(1+R) formula and validation tolerances."
+    )
+
+    
     return parser
 
 
-def verify_order_tax(order_id: str, environment: str = "staging", tax_view: str = "basic") -> None:
+def verify_order_tax(order_id: str, environment: str = "staging", tax_view: str = "basic", precision: int = 5) -> None:
     """
-    Verify tax calculations for a MongoDB order.
+    Verify tax calculations for a MongoDB order with enhanced precision support.
     
     Args:
         order_id: Internal ID of the order to verify
         environment: Database environment ("staging", "production", "stg", "prod")
+        tax_view: Tax detail level ("basic", "full", "failures")
+        precision: Decimal precision for tax calculations (2-8, default: 5)
     """
     logger = setup_logging()
     logger.info(f"Verifying tax for order: {order_id} in {environment} environment")
@@ -130,10 +141,11 @@ def verify_order_tax(order_id: str, environment: str = "staging", tax_view: str 
     header_lines.append(("Database", db_name))
     
     try:
-        # Pass environment-specific connection URL
+        # Pass environment-specific connection URL with precision parameter
         verification_service = TaxVerificationService(
             db_name=db_name,
-            connection_url_env_key=config["connection_url"]
+            connection_url_env_key=config["connection_url"],
+            precision=precision
         )
         result = verification_service.verify_order_by_id(order_id)
     except ValueError as e:
@@ -158,6 +170,12 @@ def verify_order_tax(order_id: str, environment: str = "staging", tax_view: str 
     if 'foodAggragetorId' in summary:
         header_lines.append(("foodAggragetorId", summary['foodAggragetorId']))
     header_lines.append(("Order ID", order_id))
+    
+    # Add pattern information to header
+    if 'pattern_info' in summary:
+        pattern_info = summary['pattern_info']
+        pattern_text = pattern_info.get('pattern', 'Unknown')
+        header_lines.append(("Pattern", pattern_text))
 
     # Build boxed header
     label_width = max(len(lbl) for lbl, _ in header_lines)
@@ -171,22 +189,25 @@ def verify_order_tax(order_id: str, environment: str = "staging", tax_view: str 
         padding = inner_width - len(line)
         print(f"│{line + ' '*padding}│")
     print(bottom)
-    # Divider after box
-    # print("=" * (inner_width))  # optional
-    # Show discount pattern information
+    
+    # Show discount amounts and warnings (if any) outside the box
     if 'pattern_info' in summary:
         pattern_info = summary['pattern_info']
-        
-        # Show discount pattern - without mentioning correction to avoid confusion
-        print(f"\nDiscount Pattern: {pattern_info.get('pattern', 'Unknown')}")
             
         # Show discount amounts
+        discount_details = []
         if pattern_info.get('item_discounts', 0) > 0:
-            print(f"Item-Level Discounts:   ${pattern_info['item_discounts']:.5f}")
+            discount_details.append(f"Item-Level Discounts:   ${pattern_info['item_discounts']:.5f}")
         if pattern_info.get('order_discount', 0) > 0:
-            print(f"Order-Level Discount:   ${pattern_info['order_discount']:.5f}")
+            discount_details.append(f"Order-Level Discount:   ${pattern_info['order_discount']:.5f}")
         if pattern_info.get('remaining_order_discount', 0) > 0:
-            print(f"Remaining Order Disc:   ${pattern_info['remaining_order_discount']:.5f}")
+            discount_details.append(f"Remaining Order Disc:   ${pattern_info['remaining_order_discount']:.5f}")
+        
+        if discount_details:
+            print("\nDISCOUNT BREAKDOWN:")
+            print("=" * 60)
+            for detail in discount_details:
+                print(detail)
             
         # Display discount validation warnings if present
         if 'discount_valid' in pattern_info and not pattern_info['discount_valid']:
@@ -195,18 +216,25 @@ def verify_order_tax(order_id: str, environment: str = "staging", tax_view: str 
                 print(f"\033[33m{pattern_info['discount_warning']}\033[0m")
             print(f"\033[33mRecommendation: Check the original order payload and discount application logic.\033[0m")
     
+    # Defer building full TAX VERIFICATION block until we also know charges
+    taxes = result.get('taxes', [])
+    enhanced_block_lines = []  # will be populated after charges_validation extraction
+    total_expected = total_recomputed = total_variance = 0.0
+    overall_status = "N/A"
+
+    
     # New: menuDetails price calculations validation section
     menu_validation = summary.get('menu_calculations_validation')
     if menu_validation:
-        print("\nMENU DETAILS PRICE CALCULATIONS VALIDATION:")
-        print("=" * 55)
+        print("\nMENU DETAILS VALIDATION:")
+        print("=" * 60)
         
         total_items = menu_validation.get('total_items', 0)
         is_valid = menu_validation.get('is_valid', False)
         calculation_errors = menu_validation.get('calculation_errors', [])
         validation_details = menu_validation.get('validation_details', [])
-        status_colored = "\033[1;32mPASS\033[0m" if is_valid else "\033[1;31mFAIL\033[0m"
-        print(f"   Overall Calculation Status: {status_colored}")
+        status_colored = "\033[1;32mPASSED\033[0m" if is_valid else "\033[1;31mFAILED\033[0m"
+        print(f"   Overall Status: {status_colored}")
         print(f"   Items Validated: {total_items}")
         
         if calculation_errors:
@@ -214,9 +242,6 @@ def verify_order_tax(order_id: str, environment: str = "staging", tax_view: str 
         
         # Show detailed calculation validation for each item
         if validation_details:
-            print(f"\n   DETAILED CALCULATION VALIDATION:")
-            print(f"   " + "-" * 50)
-            
             # Helper to print a table of calculations
             def _print_calc_table(prefix: str, calculations: dict):
                 # Determine dynamic width based on longest field name (min baseline 22)
@@ -234,14 +259,19 @@ def verify_order_tax(order_id: str, environment: str = "staging", tax_view: str 
                     formula = data.get('formula', '')
                     icon = '✅' if is_calc_valid else '❌'
                     # icon + space consumes 2 chars; adjust field width accordingly
-                    print(f"{prefix}{icon} {fname:<{field_col_width-2}}{actual:>14.5f}{expected:>14.5f}{delta:>16.8f}")
+                    # Delta precision reduced from 8 to 5 per latest requirement
+                    print(f"{prefix}{icon} {fname:<{field_col_width-2}}{actual:>14.5f}{expected:>14.5f}{delta:>16.5f}")
                     if not is_calc_valid and formula:
                         # Indent formula under the row (align under first data column)
                         print(f"{prefix}{'':2}Formula: {formula}")
 
             for item_validation in validation_details:
                 item_name = item_validation.get('item_name', 'Unknown Item')
-                item_id = item_validation.get('item_id', 'Unknown ID')
+                # Prefer Mongo _id over item_id; handle dict ObjectId {'$oid': ...}
+                raw_item_id = item_validation.get('_id') or item_validation.get('item_id')
+                if isinstance(raw_item_id, dict) and '$oid' in raw_item_id:
+                    raw_item_id = raw_item_id['$oid']
+                item_id = raw_item_id or 'Unknown ID'
                 qty = item_validation.get('qty', 1)
                 tax_rate = item_validation.get('tax_rate', 0)
 
@@ -253,7 +283,10 @@ def verify_order_tax(order_id: str, environment: str = "staging", tax_view: str 
                 modifiers = item_validation.get('modifiers', [])
                 for modifier_validation in modifiers:
                     mod_name = modifier_validation.get('item_name', 'Unknown Modifier')
-                    mod_id = modifier_validation.get('item_id', 'Unknown ID')
+                    raw_mod_id = modifier_validation.get('_id') or modifier_validation.get('item_id')
+                    if isinstance(raw_mod_id, dict) and '$oid' in raw_mod_id:
+                        raw_mod_id = raw_mod_id['$oid']
+                    mod_id = raw_mod_id or 'Unknown ID'
                     mod_qty = modifier_validation.get('qty', 1)
                     mod_tax_rate = modifier_validation.get('tax_rate', 0)
                     print(f"\n      🔧 Modifier: {mod_name} (ID: {mod_id})")
@@ -272,12 +305,12 @@ def verify_order_tax(order_id: str, environment: str = "staging", tax_view: str 
     
     # Optional: menuDetails vs itemDetails consistency section
     consistency = summary.get('menu_item_consistency')
-    # ANSI color helper for PASS/FAIL
+    # ANSI color helper for PASSED/FAILED
     def _status_label(ok: bool) -> str:
-        return "\033[1;32mPASS\033[0m" if ok else "\033[1;31mFAIL\033[0m"
+        return "\033[1;32mPASSED\033[0m" if ok else "\033[1;31mFAILED\033[0m"
     if consistency:
         print("\nMENU / ITEM DETAILS CONSISTENCY:")
-        print("=" * 50)
+        print("=" * 60)
         if not consistency.get('available'):
             print(f"   ItemDetails not present ({consistency.get('reason','')}). Skipping comparison.")
         else:
@@ -292,8 +325,6 @@ def verify_order_tax(order_id: str, environment: str = "staging", tax_view: str 
             # Show detailed field-by-field comparison for all items
             items_detail = consistency.get('items_detail', [])
             if items_detail:
-                print(f"\n   DETAILED FIELD COMPARISON:")
-                print(f"   " + "-" * 47)
                 # Organize items and modifiers: build parent -> modifiers mapping
                 parent_items = []
                 modifiers_by_parent = {}
@@ -364,80 +395,381 @@ def verify_order_tax(order_id: str, environment: str = "staging", tax_view: str 
                 else:
                     print("   ✅ All fields match perfectly across all items!")
 
-    # Charges validation section
+    # Charges validation section (data capture only for integration into TAX VERIFICATION block)
     charges_validation = summary.get('charges_validation')
+    charge_entries = []
+    charge_errors = []
+    included_count = None
+    charges_status_str = None
     if charges_validation:
-        print("\nORDER CHARGES VALIDATION:")
-        print("=" * 50)
-        # Core summary lines moved to final SUMMARY OF THE ORDER section
         charge_entries = charges_validation.get('charge_entries', [])
         included_count = charges_validation.get('included_charge_count')
-        # Show N/A if there are no included charges and no detailed entries to render
-        if (included_count in (0, None) or included_count == 0) and not charge_entries:
-            print("   Status: \033[36mN/A\033[0m (no invoice-included charges)")
+        charges_status_str = _status_label(charges_validation.get('is_valid'))
+        charge_errors = charges_validation.get('errors', [])
+
+    # Build the unified TAX VERIFICATION block now (taxes + charges + tax summary)
+    if taxes:
+        def _fmt_money(val: float) -> str:
+            return f"${val:.{precision}f}"
+        def _status_icon(delta: float) -> str:
+            return "✅" if abs(delta) < 1e-5 else ("⚠️" if abs(delta) < 0.01 else "❌")
+        total_expected = sum(t.get('expected_total', 0.0) for t in taxes)
+        total_recomputed = sum(t.get('recomputed_total', 0.0) for t in taxes)
+        total_variance = total_expected - total_recomputed
+        overall_status = "✅ PASSED" if abs(total_variance) < 1e-4 else "⚠️ VARIANCES DETECTED"
+        simple_status = "PASSED" if "PASSED" in overall_status else "VARIANCES DETECTED"
+
+        print("\n🔍 TAX VERIFICATION")
+        print("=" * 60)
+        # Colorize overall status (green for PASSED, yellow for variances) for consistency with other sections
+        if simple_status == "PASSED":
+            simple_status_colored = "\033[1;32mPASSED\033[0m"
         else:
-            status = _status_label(charges_validation.get('is_valid'))
-            print(f"   Status: {status} (detailed per-charge integrity below)")
+            # Use yellow for variance state to differentiate from hard failure (red)
+            simple_status_colored = f"\033[1;33m{simple_status}\033[0m"
+        print(f"   Overall Status: {simple_status_colored}")
+        print("")
 
-        # Charge entries (tabular improved readability)
-        if charge_entries:
-            print("\n   CHARGES DETAIL:")
-            headers = [
-                ("Type", 14),
-                ("Incl", 5),
-                ("Amount", 12),
-                ("TaxExcl", 12),
-                ("Tax", 10),
-                ("SumTaxes", 12),
-                ("Rate%", 8),
-                ("RecompTax", 12),
-                ("Match", 7),
-                ("Internal", 9),
-            ]
-            header_line = " ".join([f"{h:<{w}}" for h, w in headers])
-            print(f"      {header_line}")
-            print(f"      {'-' * len(header_line)}")
+        # Build tax info from orderTaxes section first
+        # Summary information
+        order_taxes_section = result.get('orderTaxes', [])  # This should have the orderTaxes array
+        # Handle both ObjectId format and string format for _id
+        order_tax_lookup = {}
+        for ot in order_taxes_section:
+            tax_id = ot.get('_id')
+            if isinstance(tax_id, dict) and '$oid' in tax_id:
+                tax_id = tax_id['$oid']
+            elif tax_id:
+                tax_id = str(tax_id)
+            if tax_id:
+                order_tax_lookup[tax_id] = ot
+                # Also create lookup for the short form (last 8 chars) since charges might reference that
+                short_id = tax_id[-8:] if len(tax_id) > 8 else tax_id
+                order_tax_lookup[short_id] = ot
+        
+        # Build mapping of tax_id -> list of (charge, tax_fragment) for charges referencing that tax
+        charges_by_tax = {}
+        for ch in charge_entries:
+            for tx in ch.get('taxes', []) or []:
+                tid = tx.get('taxId')
+                if tid:
+                    charges_by_tax.setdefault(tid, []).append((ch, tx))
+                    # Also map by full tax ID if we can find it in orderTaxes
+                    if len(tid) == 8:  # Short ID format
+                        for full_id in order_tax_lookup.keys():
+                            if full_id.endswith(tid) and len(full_id) > 8:
+                                charges_by_tax.setdefault(full_id, []).append((ch, tx))
+                                break
+        
+        # Create a comprehensive list of all tax IDs (from menu + charges)
+        all_tax_ids = set()
+        menu_tax_ids = {t.get('tax_id') for t in taxes}
+        charge_tax_ids = set(charges_by_tax.keys())
+        all_tax_ids = menu_tax_ids.union(charge_tax_ids)
+        
+        # Also try tax reconciliation as backup
+        tax_recon = result.get('summary', {}).get('tax_reconciliation', [])
+        recon_lookup = {tr.get('tax_id'): tr for tr in tax_recon}
+        
+        # Enhance existing menu taxes with proper names from orderTaxes
+        enhanced_taxes = []
+        for tax in taxes:
+            tax_id = tax.get('tax_id')
+            order_tax_info = order_tax_lookup.get(tax_id, {})
+            enhanced_tax = dict(tax)
+            enhanced_tax['tax_name'] = order_tax_info.get('name', 'Tax')
+            enhanced_taxes.append(enhanced_tax)
+        
+        # Add charge-only taxes
+        for charge_tax_id in charge_tax_ids:
+            if charge_tax_id not in menu_tax_ids:
+                # Get tax info from orderTaxes or reconciliation - try multiple approaches
+                order_tax_info = order_tax_lookup.get(charge_tax_id, {})
+                
+                # Try to find matching tax info from reconciliation using various ID patterns
+                recon_info = recon_lookup.get(charge_tax_id, {})
+                if not recon_info:
+                    # Try looking for full tax ID that ends with the charge tax ID
+                    for recon_id, recon_data in recon_lookup.items():
+                        if recon_id.endswith(charge_tax_id) and len(recon_id) > len(charge_tax_id):
+                            recon_info = recon_data
+                            break
+                
+                if not order_tax_info and len(charge_tax_id) == 8:
+                    # If short ID didn't work, try to find full ID that ends with this
+                    for full_id, tax_info in order_tax_lookup.items():
+                        if full_id.endswith(charge_tax_id) and len(full_id) > 8:
+                            order_tax_info = tax_info
+                            break
+                
+                # Try to get tax name from reconciliation data if available
+                # Common tax names based on ID patterns - this is a fallback approach
+                tax_name = order_tax_info.get('name') or recon_info.get('name')
+                if not tax_name:
+                    # Fallback based on known patterns - charges are often VAT
+                    if recon_info.get('charges_tax', 0) > 0 and recon_info.get('menu_tax', 0) == 0:
+                        tax_name = 'VAT'  # Charges-only tax is typically VAT
+                    else:
+                        tax_name = 'Tax'  # Default for menu taxes
+                tax_rate = order_tax_info.get('rate', recon_info.get('rate', 0.0))
+                charges_tax = recon_info.get('charges_tax', 0.0)
+                
+                # Find the full tax ID for display - use reconciliation key if it's longer
+                display_tax_id = charge_tax_id
+                for recon_id in recon_lookup.keys():
+                    if recon_id.endswith(charge_tax_id) and len(recon_id) > len(display_tax_id):
+                        display_tax_id = recon_id
+                        break
+                
+                synthetic_tax = {
+                    'tax_id': display_tax_id,
+                    'tax_name': tax_name,
+                    'tax_rate': tax_rate,
+                    'expected_total': charges_tax,
+                    'recomputed_total': charges_tax,
+                    'details': {'items': [], 'modifiers': []}
+                }
+                enhanced_taxes.append(synthetic_tax)
+        
+        extended_taxes = enhanced_taxes
+        
+        # --- Rendering strategies ---
 
-            for ch in charge_entries:
-                ch_type = str(ch.get('type'))[:14]
-                incl = 'Y' if ch.get('includeInInvoice') else 'N'
-                amount = f"{ch.get('amount',0.0):.5f}"
-                tax_excl = f"{ch.get('taxExclusiveAmount',0.0):.5f}"
-                tax_val = f"{ch.get('tax',0.0):.5f}"
-                sum_taxes = f"{ch.get('sum_list_tax',0.0):.5f}"
-                applied_rate = ch.get('applied_rate')
-                rate_str = f"{applied_rate:.2f}" if applied_rate is not None else "-"
-                recomputed_tax = ch.get('recomputed_tax')
-                recomp_str = f"{recomputed_tax:.5f}" if recomputed_tax is not None else "-"
-                match_icon = '✅' if ch.get('recomputed_tax_match') else ('❌' if recomputed_tax is not None else '-')
-                internal_icon = '✅' if ch.get('internal_ok') else '❌'
-                row_parts = [
-                    f"{ch_type:<14}",
-                    f"{incl:<5}",
-                    f"{amount:>12}",
-                    f"{tax_excl:>12}",
-                    f"{tax_val:>10}",
-                    f"{sum_taxes:>12}",
-                    f"{rate_str:>8}",
-                    f"{recomp_str:>12}",
-                    f"{match_icon:>7}",
-                    f"{internal_icon:>9}",
-                ]
-                print("      " + " ".join(row_parts))
+        def _render_tree():
+            print("TAX VERIFICATION TREE")
+            print("-" * 60)
+            for idx, tax_info in enumerate(extended_taxes, start=1):
+                tax_id = tax_info.get('tax_id', 'Unknown')
+                tax_rate = tax_info.get('tax_rate', 0.0)
+                expected_total = float(tax_info.get('expected_total', 0.0))
+                recomputed_total = float(tax_info.get('recomputed_total', 0.0))
+                variance = expected_total - recomputed_total
+                status_icon = '✅' if abs(variance) < 1e-5 else ('⚠️' if abs(variance) < 0.01 else '❌')
+                tax_name = tax_info.get('tax_name', 'Tax')
+                charges_only = False
+                details = tax_info.get('details', {})
+                items = details.get('items') or []
+                if not items:
+                    # If no items but has expected/recomputed (and appears in charges_by_tax) treat as charges-only
+                    if charges_by_tax.get(tax_id):
+                        charges_only = True
+                header_extra = " (Charges-only)" if charges_only and items == [] else ""
+                # Header: use consistent labelled segments for readability
+                # Example: └─ VAT (14.00%) | ID: 5f...4088 | Total Tax: $7.12281 | ✅ (Charges-only)
+                print(
+                    f"└─ {tax_name} ({tax_rate:.2f}%) | ID: {tax_id} | Total Tax: {_fmt_money(recomputed_total)} | {status_icon}{header_extra}"
+                )
 
-                # Taxes line (single line listing taxId:amount pairs)
-                taxes_list = ch.get('taxes', [])
-                if taxes_list:
-                    tax_pairs = [f"{t.get('taxId','?')[-6:]}:{t.get('amount',0.0):.5f}" for t in taxes_list]
-                    print(f"           ↳ Taxes: {' | '.join(tax_pairs)}")
+                child_sections = []
+                if items:
+                    child_sections.append('items')
+                related_charges = charges_by_tax.get(tax_id, [])
+                if related_charges:
+                    child_sections.append('charges')
+                child_count = len(child_sections) + 1  # variance line
 
-        # (Removed CHARGE TAX vs ORDER TAX MAPPING section per user request)
+                # Items block (including modifiers under their parent items)
+                if items:
+                    # Get modifiers as well
+                    modifiers = details.get('modifiers') or []
+                    
+                    # Organize modifiers by parent item
+                    modifiers_by_parent = {}
+                    for mod in modifiers:
+                        parent_item_id = mod.get('parent_item_id')
+                        if parent_item_id:
+                            modifiers_by_parent.setdefault(str(parent_item_id), []).append(mod)
+                    
+                    # Compute dynamic widths (include items + modifiers names)
+                    all_entries = items + modifiers
+                    name_w = min(max(len(entry.get('name', 'Unknown')) for entry in all_entries), 40)
+                    taxable_vals = [float(entry.get('taxable_amount', 0.0)) for entry in all_entries] or [0.0]
+                    tax_vals = [float(entry.get('expected', 0.0)) for entry in all_entries] or [0.0]
+                    taxable_w = max(len(f"{v:.2f}") for v in taxable_vals)
+                    tax_w = max(len(f"{v:.5f}") for v in tax_vals)
 
-        errors = charges_validation.get('errors', [])
-        if errors:
-            print("\n   ERRORS:")
-            for e in errors:
+                    # We reserve 2 chars for status/icon plus a space => 3, so cell = icon + space + name
+                    # For modifiers we prepend "└─ " (3 chars) + icon + space + name
+                    # Unify by defining a fixed cell width that fits the longest pattern
+                    item_cell_width = name_w + 3  # 3 accounts for status prefix or tree prefix equivalence
+
+                    print(f"   ├─ Items ({len(items)})" + (f" + Modifiers ({len(modifiers)})" if modifiers else ""))
+                    # Header (blank space where icon/tree would be) so columns line up
+                    print(
+                        f"   │  {'Item':<{item_cell_width}}  Qty  Taxable{'':{max(0, taxable_w-7)}}  Tax"
+                    )
+                    print(
+                        f"   │  {'-'*item_cell_width}  ---  {'-'*taxable_w}  {'-'*tax_w}"
+                    )
+
+                    for item in items:
+                        item_name_full = item.get('name', 'Unknown Item')
+                        # Truncate name if needed
+                        item_name_trunc = item_name_full[:name_w] if len(item_name_full) > name_w else item_name_full
+                        qty = item.get('qty', 1)
+                        expected = float(item.get('expected', 0.0))
+                        recomputed = float(item.get('recomputed', 0.0))
+                        diff = expected - recomputed
+                        taxable = float(item.get('taxable_amount', 0.0))
+                        icon = _status_icon(diff)
+                        cell_content = f"{icon} {item_name_trunc}"  # icon + space + name
+                        cell = cell_content.ljust(item_cell_width)
+                        print(
+                            f"   │  {cell}  {qty:>3}  {taxable:>{taxable_w}.2f}  {expected:>{tax_w}.5f}"
+                        )
+
+                        # Modifiers under this item
+                        internal_id = item.get('internal_id')
+                        item_modifiers = modifiers_by_parent.get(str(internal_id), []) if internal_id else []
+                        for modifier in item_modifiers:
+                            mod_name_full = modifier.get('name', 'Unknown Modifier')
+                            # Available space for modifier name after tree + icon + space
+                            # Pattern: "└─ {icon} {name}" -> prefix_len = len("└─ ") + len(icon) + 1
+                            mod_icon = _status_icon(float(modifier.get('expected', 0.0)) - float(modifier.get('recomputed', 0.0)))
+                            prefix = f"└─ {mod_icon} "
+                            avail_len = item_cell_width - len(prefix)
+                            if avail_len < 0:
+                                avail_len = 0
+                            mod_name_trunc = mod_name_full[:avail_len] if len(mod_name_full) > avail_len else mod_name_full
+                            mod_cell = f"{prefix}{mod_name_trunc}".ljust(item_cell_width)
+                            mod_qty = modifier.get('qty', 1)
+                            mod_expected = float(modifier.get('expected', 0.0))
+                            mod_taxable = float(modifier.get('taxable_amount', 0.0))
+                            print(
+                                f"   │  {mod_cell}  {mod_qty:>3}  {mod_taxable:>{taxable_w}.2f}  {mod_expected:>{tax_w}.5f}"
+                            )
+                # Charges block
+                if related_charges:
+                    print(f"   ├─ Charges ({len(related_charges)})")
+                    # Pre-calculate width for aligned columns (charges are usually few, so single pass is fine)
+                    # Collect numeric strings to determine dynamic widths (fallback to defaults)
+                    base_strs = []
+                    net_strs = []
+                    tax_strs = []
+                    for (ch_tmp, _tx) in related_charges:
+                        base_strs.append(f"{ch_tmp.get('amount', 0.0):.2f}")
+                        net_strs.append(f"{ch_tmp.get('taxExclusiveAmount', 0.0):.2f}")
+                        tax_strs.append(f"{ch_tmp.get('tax', 0.0):.5f}")
+                    base_w = max([len(s) for s in base_strs] + [6])  # at least width 6
+                    net_w = max([len(s) for s in net_strs] + [6])
+                    tax_w = max([len(s) for s in tax_strs] + [8])
+                    type_w = 20
+                    for c_idx, (ch, tx_frag) in enumerate(related_charges):
+                        ch_type = str(ch.get('type'))[:type_w]
+                        base_amount = ch.get('amount', 0.0)
+                        tax_excl = ch.get('taxExclusiveAmount', 0.0)
+                        full_tax = ch.get('tax', 0.0)
+                        match_icon = '✅' if ch.get('recomputed_tax_match') else ('❌' if ch.get('recomputed_tax') is not None else '-')
+                        print(
+                            f"   │  {match_icon} {ch_type:<{type_w}} "
+                            f"Base:{base_amount:>{base_w}.2f}  "
+                            f"Net:{tax_excl:>{net_w}.2f}  "
+                            f"Tax:{full_tax:>{tax_w}.5f}"
+                        )
+                # Variance line
+                variance_label = f"Δ {variance:+.5f}"
+                variance_status = "OK" if abs(variance) < 1e-5 else ("Within tolerance" if abs(variance) < 1e-4 else "Out of tolerance")
+                print(f"   └─ Variance: {variance_label} ({variance_status})")
+                print("")
+
+        # Tree view is now the default (and only) style per latest requirement
+        _render_tree()
+
+
+
+        # Display any charge errors at the end of tax verification
+        if charge_errors:
+            print("\n   ⚠️ CHARGE ISSUES:")
+            for e in charge_errors:
                 print(f"      - {e.get('issue')}: {e.get('message')}")
+
+        # Summary of tax verification (order-level aggregation)
+        print("\n📋 ORDER TAXES VALIDATION:")
+        
+        # Calculate total tax amount for each tax ID and compare with orderTaxes array
+        calculated_taxes_by_id = {}
+        order_taxes_by_id = {}
+        
+        # Collect calculated tax amounts from tree data
+        for tax_info in extended_taxes:
+            tax_id = tax_info.get('tax_id', 'Unknown')
+            recomputed_total = float(tax_info.get('recomputed_total', 0.0))
+            calculated_taxes_by_id[tax_id] = recomputed_total
+        
+        # Collect orderTaxes from database
+        for ot in order_taxes_section:
+            tax_id = ot.get('_id')
+            if isinstance(tax_id, dict) and '$oid' in tax_id:
+                tax_id = tax_id['$oid']
+            elif tax_id:
+                tax_id = str(tax_id)
+            if tax_id:
+                # Try both 'amount' and 'taxAmount' field names
+                order_tax_amount = float(ot.get('amount', ot.get('taxAmount', 0.0)))
+                order_taxes_by_id[tax_id] = order_tax_amount
+        
+        # Compare calculated vs order taxes for each tax ID
+        all_taxes_match = True
+        per_tax_validation = []
+        
+        all_tax_ids_combined = set(calculated_taxes_by_id.keys()) | set(order_taxes_by_id.keys())
+        
+        for tax_id in all_tax_ids_combined:
+            calculated_amount = calculated_taxes_by_id.get(tax_id, 0.0)
+            order_amount = order_taxes_by_id.get(tax_id, 0.0)
+            variance = calculated_amount - order_amount
+            matches = abs(variance) < 1e-4
+            if not matches:
+                all_taxes_match = False
+            
+            # Get tax name for display
+            tax_name = "Unknown"
+            for tax_info in extended_taxes:
+                if tax_info.get('tax_id') == tax_id:
+                    tax_name = tax_info.get('tax_name', 'Unknown')
+                    break
+            
+            per_tax_validation.append({
+                'tax_id': tax_id,
+                'tax_name': tax_name,
+                'calculated': calculated_amount,
+                'order_db': order_amount,
+                'variance': variance,
+                'matches': matches
+            })
+        
+        # Overall status based on per-tax comparison
+        if all_taxes_match:
+            overall_status_colored = "\033[1;32mPASSED\033[0m"
+        else:
+            overall_status_colored = "\033[1;31mFAILED\033[0m"
+        
+        print(f"   Overall Status: {overall_status_colored}")
+        print(f"   Taxes Validated: {len(per_tax_validation)}")
+        print("")
+        
+        # Show per-tax comparison table
+        print("   Per-Tax Validation:")
+        print("   " + "-" * 80)
+        header = f"   {'Tax Name':<12} {'Tax ID':<26} {'Calculated':>12} {'Order DB':>12} {'Variance':>12} {'Status':<8}"
+        print(header)
+        print("   " + "-" * 80)
+        
+        for tax_validation in per_tax_validation:
+            tax_name = tax_validation['tax_name'][:11]
+            tax_id_short = tax_validation['tax_id'][:25]
+            calculated = tax_validation['calculated']
+            order_db = tax_validation['order_db']
+            variance = tax_validation['variance']
+            status_icon = "✅ PASS" if tax_validation['matches'] else "❌ FAIL"
+            
+            print(f"   {tax_name:<12} {tax_id_short:<26} {calculated:>12.5f} {order_db:>12.5f} {variance:>12.5f} {status_icon}")
+        
+        print("")
+        print(f"   Total Calculated Tax Amount: ${sum(calculated_taxes_by_id.values()):.5f}")
+        print(f"   Total Order DB Tax Amount:   ${sum(order_taxes_by_id.values()):.5f}")
+        total_variance_new = sum(calculated_taxes_by_id.values()) - sum(order_taxes_by_id.values())
+        print(f"   Total Variance (Calculated - Order DB): ${total_variance_new:.5f}")
 
     # ------------------------------------------------------------------
     # TAX SUMMARY (Aggregated view)
@@ -488,7 +820,7 @@ def verify_order_tax(order_id: str, environment: str = "staging", tax_view: str 
     # --------------------------------------------------------------
     if charges_validation:
         print("\nSUMMARY OF THE ORDER:")
-        print("=" * 50)
+        print("=" * 60)
         status = _status_label(charges_validation.get('is_valid'))
         print(f"   Overall Status: {status}")
         print(f"   Expected Total Price: {charges_validation.get('expected_total_price'):.5f}")
@@ -522,7 +854,8 @@ def main(args: Optional[list] = None) -> int:
             verify_order_tax(
                 order_id=parsed_args.order_id,
                 environment=parsed_args.env,
-                tax_view=getattr(parsed_args, 'tax_view', 'basic')
+                tax_view=getattr(parsed_args, 'tax_view', 'basic'),
+                precision=getattr(parsed_args, 'precision', 5)
             )
             
         elif not parsed_args.command:

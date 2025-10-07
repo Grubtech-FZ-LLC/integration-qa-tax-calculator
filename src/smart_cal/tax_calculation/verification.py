@@ -10,10 +10,11 @@ from .repository import OrderRepository
 class TaxVerificationService:
     """High-level service for tax verification operations."""
     
-    def __init__(self, db_name: str = None, connection_url_env_key: str = None):
-        self.verifier = OrderTaxVerifier()
+    def __init__(self, db_name: str = None, connection_url_env_key: str = None, precision: int = 5):
+        self.verifier = OrderTaxVerifier(precision=precision)
         self.db_name = db_name
         self.connection_url_env_key = connection_url_env_key
+        self.precision = precision
         
     def verify_order_by_id(self, order_id: str) -> Dict[str, Any]:
         """Verify tax calculations for an order by its internal ID."""
@@ -44,22 +45,54 @@ class TaxVerificationService:
                 'order_id': order_id,
                 'order_amount': sum(comp['order_amount'] for comp in result.get('comparisons', [])),
                 'taxes': taxes,
-                'summary': result.get('summary', {})
+                'summary': result.get('summary', {}),
+                'orderTaxes': result.get('orderTaxes', [])  # Pass through orderTaxes for CLI validation
             }
 
 
 class OrderTaxVerifier:
     """Compare calculated menu taxes with stored order taxes.
 
-    This is a simplified verifier that:
-    - Iterates menuDetails (items and modifiers)
-    - Sums expected tax amounts by taxId
-    - Recomputes tax using BasicTaxCalculator based on totalPrice and rate
-    - Returns per-taxId comparison and a summary
+    Enhanced verifier with precision support that:
+    - Iterates menuDetails (items and modifiers) with 5-decimal precision
+    - Detects discount patterns (Patterns 1-4) with improved tolerance handling
+    - Recomputes tax using r_j/(1+R) formula with decoupled calculation logic
+    - Provides transparent per-tax component breakdown and validation
+    - Returns per-taxId comparison with detailed analysis
     """
 
-    def __init__(self) -> None:
-        pass
+    def __init__(self, precision: int = 5) -> None:
+        self.precision = precision
+        self._precision_multiplier = 10 ** precision
+    
+    def _r(self, taxable_amount: float, rate_j: float, total_rate_R: float) -> float:
+        """
+        Calculate per-tax component using r_j/(1+R) formula with precision control.
+        
+        This method implements the core tax calculation formula:
+        tax_component_j = taxable_amount * (r_j / (1 + R))
+        
+        Where:
+        - r_j is the individual tax rate (as decimal, e.g., 0.05 for 5%)
+        - R is the sum of all applicable tax rates (as decimal)
+        - taxable_amount is the tax-inclusive amount after discount allocation
+        
+        Args:
+            taxable_amount: Tax-inclusive amount to calculate tax from
+            rate_j: Individual tax rate as decimal (e.g., 0.05 for 5%)
+            total_rate_R: Sum of all applicable tax rates as decimal
+            
+        Returns:
+            Calculated tax component rounded to specified precision
+        """
+        if taxable_amount <= 0 or rate_j <= 0 or total_rate_R <= 0:
+            return 0.0
+            
+        # Apply r_j/(1+R) formula for proportional tax allocation
+        tax_component = taxable_amount * (rate_j / (1.0 + total_rate_R))
+        
+        # Round to specified precision
+        return round(tax_component, self.precision)
 
     def _get_order_level_discount(self, order_data: Dict[str, Any]) -> float:
         """Extract order-level discount from paymentDetails.priceDetails.discountAmount."""
@@ -155,9 +188,10 @@ class OrderTaxVerifier:
             return 0.0
         
         # Step 3: Get rate from orderTaxes where _id matches the tax_id
+        normalized_tax_id = self._normalize_id(tax_id)
         for order_tax in order_data.get("orderTaxes", []):
-            order_tax_id = str(order_tax.get("_id", order_tax.get("taxId", "")))
-            if order_tax_id == str(tax_id):
+            order_tax_id = self._normalize_id(order_tax.get("_id", order_tax.get("taxId", "")))
+            if order_tax_id == normalized_tax_id:
                 return float(order_tax.get("rate", order_tax.get("taxRate", 0.0)))
         
         # If rate not found in orderTaxes, return 0
@@ -177,120 +211,588 @@ class OrderTaxVerifier:
         return total  # Return exact DB value without rounding
 
     def _recompute_menu_tax(self, order_data: Dict[str, Any], tax_id: str) -> float:
-        rate = self._get_tax_rate_by_id(order_data, tax_id)
-        if rate <= 0:
+        """
+        Enhanced tax recomputation with decoupled calculation logic and 5-decimal precision.
+        
+        This method implements pattern-aware tax calculation using the r_j/(1+R) formula:
+        1. Determines discount pattern with enhanced validation
+        2. Calculates taxable bases for items and modifiers based on pattern
+        3. Applies r_j/(1+R) formula for precise tax component calculation
+        4. Returns aggregated tax amount rounded to specified precision
+        
+        Args:
+            order_data: Complete order data dictionary
+            tax_id: Target tax ID to calculate
+            
+        Returns:
+            Recomputed tax amount with precision control
+        """
+        # Store order data for decoupled rate lookups
+        self._current_order_data = order_data
+        
+        # Get tax rate and validate
+        rate_percent = self._get_tax_rate_by_id(order_data, tax_id)
+        if rate_percent <= 0:
             return 0.0
         
-        # Check discount types present
-        has_item_discounts = self._has_item_level_discounts(order_data)
-        order_discount = self._get_order_level_discount(order_data)
-        total_item_discounts = self._get_total_item_level_discounts(order_data)
+        rate_decimal = rate_percent / 100.0
         
-        # Pattern determination:
-        # Pattern 1: No discounts at all
-        # Pattern 2: Only order-level discount
-        # Pattern 3: Only item-level discounts 
-        # Pattern 4: Both item-level AND order-level discounts (combination)
-        if has_item_discounts and order_discount > 0:
-            # Pattern 4: Combined discounts
-            # First apply item-level discounts, then distribute remaining order discount
-            # remaining_order_discount = total_order_discount - total_item_level_discounts
-            remaining_order_discount = max(0.0, order_discount - total_item_discounts)
-        elif has_item_discounts:
-            # Pattern 3: Item-level discounts only
-            remaining_order_discount = 0.0
-        else:
-            # Pattern 2: Order-level discount distribution (or Pattern 1 if order_discount = 0)
-            remaining_order_discount = order_discount
+        # Get enhanced pattern validation with precision-aware tolerance
+        pattern_info = self._validate_discount_consistency(order_data)
+        pattern_code = pattern_info["pattern_code"]
         
-        total = 0.0
+        # Get discount allocation parameters for decoupled calculation
+        allocation_params = self._get_discount_allocation_params(order_data, pattern_code)
+        
+        # DECOUPLED TAX CALCULATION: Calculate tax amounts independently
+        total_tax = 0.0
+        
+        # Process items
         for item in order_data.get("menuDetails", []):
-            # include item only if it has this tax_id
+            # Check if item has this tax_id
             item_has_tax = any(str(t.get("taxId")) == str(tax_id) for t in item.get("taxes", []))
             if item_has_tax:
-                price = float(item.get("price", {}).get("totalPrice", 0.0))  # Already includes item discount
-                item_discount = self._get_item_level_discount(item)  # For display only
-                
-                # Pattern 4: Item discounts already applied to totalPrice, now apply remaining order discount
-                if has_item_discounts and remaining_order_discount > 0:
-                    # Pattern 4: Apply additional order-level discount distribution
-                    # Formula: tax inclusive sub total with item level discount (a) = paymentDetails.priceDetails.unitPrice - total item level discount
-                    payment_details = order_data.get("paymentDetails", {})
-                    price_details = payment_details.get("priceDetails", {})
-                    unit_price = float(price_details.get("unitPrice", 0.0))
-                    
-                    tax_inclusive_subtotal_with_item_discount = unit_price - total_item_discounts
-                    
-                    if tax_inclusive_subtotal_with_item_discount > 0:
-                        # distributed taxable discount amount on item (b) = (order level discount / a) x item.totalPrice
-                        distributed_order_discount = (remaining_order_discount / tax_inclusive_subtotal_with_item_discount) * price
-                        # tax inclusive amount on item with discount (c) = item.totalPrice - b
-                        taxable_amount = price - distributed_order_discount
-                    else:
-                        taxable_amount = price
-                elif has_item_discounts and remaining_order_discount == 0:
-                    # Pattern 3: totalPrice is already post-discount
-                    taxable_amount = price
-                else:
-                    # Pattern 2: Apply order-level discount distribution
-                    if remaining_order_discount > 0:
-                        calculated_subtotal = self._get_calculated_subtotal(order_data)
-                        if calculated_subtotal > 0:
-                            distributed_order_discount = (remaining_order_discount / calculated_subtotal) * price
-                            taxable_amount = price - distributed_order_discount
-                        else:
-                            taxable_amount = price
-                    else:
-                        taxable_amount = price
-                    
-                total += self._inclusive_tax(taxable_amount, rate)
+                item_tax = self._calculate_decoupled_tax_amount(
+                    item, tax_id, allocation_params, pattern_code
+                )
+                total_tax += item_tax
             
-            # modifiers: include only those that have this tax_id; multiply by parent qty
+            # Process modifiers for this item
             qty = int(item.get("qty", 1))
             for mod in item.get("extraDetails", []):
                 mod_has_tax = any(str(t.get("taxId")) == str(tax_id) for t in mod.get("taxes", []))
-                if not mod_has_tax:
-                    continue
-                mprice = float(mod.get("price", {}).get("totalPrice", 0.0))  # Already includes modifier discount
-                mod_discount = self._get_modifier_level_discount(mod)  # For display only
+                if mod_has_tax:
+                    mod_tax = self._calculate_decoupled_tax_amount(
+                        mod, tax_id, allocation_params, pattern_code, parent_qty=qty
+                    )
+                    total_tax += mod_tax
+        
+        return round(total_tax, self.precision)
+    
+    def _calculate_decoupled_tax_amount(self, item_data: Dict[str, Any], tax_id: str, 
+                                      allocation_params: Dict[str, Any], pattern_code: int,
+                                      parent_qty: int = 1) -> float:
+        """
+        Calculate tax amount completely decoupled from database grossAmount/netAmount.
+        
+        This method:
+        1. Calculates taxable amount from unitPrice × qty and discount patterns
+        2. Gets tax rates from orderTaxes (not from stored amounts)
+        3. Applies r_j/(1+R) formula for precise tax calculation
+        4. Ignores any potentially incorrect grossAmount/netAmount in database
+        
+        Returns the mathematically correct tax amount based on business logic.
+        """
+        # Get core data - never trust derived fields in database
+        price_info = item_data.get("price", {})
+        unit_price = float(price_info.get("unitPrice", 0.0))
+        qty = int(item_data.get("qty", 1))
+        
+        # Skip if no price
+        if unit_price <= 0:
+            return 0.0
+        
+        # Get tax rate for this specific tax ID
+        individual_rate = self._get_item_tax_rate(item_data, tax_id)
+        if individual_rate <= 0:
+            return 0.0
+        
+        # Get total tax rate for this item (sum of all applicable taxes)
+        total_rate = self._get_total_tax_rate(item_data, "percent")
+        if total_rate <= 0:
+            return 0.0
+        
+        # Calculate taxable amount using decoupled method
+        taxable_amount = self._calculate_item_taxable_amount(
+            item_data, allocation_params, pattern_code, parent_qty
+        )
+        
+        if taxable_amount <= 0:
+            return 0.0
+        
+        # Apply r_j/(1+R) formula with proper rates
+        individual_rate_decimal = individual_rate / 100.0
+        total_rate_decimal = total_rate / 100.0
+        
+        tax_amount = self._r(taxable_amount, individual_rate_decimal, total_rate_decimal)
+        
+        # For modifiers, multiply by parent quantity
+        if parent_qty > 1:
+            tax_amount *= parent_qty
+        
+        return tax_amount
+    
+    def _calculate_taxable_bases(self, order_data: Dict[str, Any], tax_id: str, pattern_code: int) -> List[Dict[str, Any]]:
+        """
+        Calculate taxable bases for all menu items and modifiers based on discount pattern.
+        
+        This method provides decoupled taxable amount calculation supporting all patterns:
+        - Pattern 1: No discounts (taxable = gross amount)  
+        - Pattern 2: Order-level discount (proportional allocation)
+        - Pattern 3: Item-level discounts (post-discount amounts)
+        - Pattern 4: Combined discounts (two-stage allocation)
+        
+        Args:
+            order_data: Complete order data dictionary
+            tax_id: Target tax ID for filtering relevant items/modifiers
+            pattern_code: Numeric pattern code (1-4) from enhanced validation
+            
+        Returns:
+            List of taxable base dictionaries with amount and rate information
+        """
+        taxable_bases = []
+        
+        # Get pattern-specific discount allocation parameters
+        allocation_params = self._get_discount_allocation_params(order_data, pattern_code)
+        
+        # Process each menu item
+        for item in order_data.get("menuDetails", []):
+            # Check if item has this tax_id
+            item_tax_rate = self._get_item_tax_rate(item, tax_id)
+            if item_tax_rate <= 0:
+                continue
                 
-                # Pattern 4: Modifier discounts already applied to totalPrice, now apply remaining order discount
-                if has_item_discounts and remaining_order_discount > 0:
-                    # Pattern 4: Apply additional order-level discount distribution
-                    # Formula: tax inclusive sub total with item level discount (a) = paymentDetails.priceDetails.unitPrice - total item level discount
-                    payment_details = order_data.get("paymentDetails", {})
-                    price_details = payment_details.get("priceDetails", {})
-                    unit_price = float(price_details.get("unitPrice", 0.0))
+            # Calculate item taxable amount based on pattern
+            item_taxable = self._calculate_item_taxable_amount(
+                item, allocation_params, pattern_code
+            )
+            
+            if item_taxable > 0:
+                taxable_bases.append({
+                    "type": "item",
+                    "item_id": item.get("internalId", "unknown"),
+                    "item_name": item.get("name", "Unknown Item"),
+                    "taxable_amount": item_taxable,
+                    "individual_rate_decimal": item_tax_rate / 100.0,
+                    "total_rate_decimal": self._get_total_tax_rate(item, "decimal"),
+                    "qty": int(item.get("qty", 1))
+                })
+            
+            # Process modifiers for this item
+            qty = int(item.get("qty", 1))
+            for mod in item.get("extraDetails", []):
+                mod_tax_rate = self._get_item_tax_rate(mod, tax_id) 
+                if mod_tax_rate <= 0:
+                    continue
                     
-                    tax_inclusive_subtotal_with_item_discount = unit_price - total_item_discounts
-                    
-                    if tax_inclusive_subtotal_with_item_discount > 0:
-                        # distributed taxable discount amount on modifier (b) = (order level discount / a) x modifier.totalPrice  
-                        distributed_order_discount = (remaining_order_discount / tax_inclusive_subtotal_with_item_discount) * mprice
-                        # tax inclusive amount on modifier with discount (c) = modifier.totalPrice - b
-                        mod_taxable_amount = mprice - distributed_order_discount
-                    else:
-                        mod_taxable_amount = mprice
-                elif has_item_discounts and remaining_order_discount == 0:
-                    # Pattern 3: totalPrice is already post-discount
-                    mod_taxable_amount = mprice
+                # Calculate modifier taxable amount (multiplied by parent qty later)
+                mod_taxable_base = self._calculate_item_taxable_amount(
+                    mod, allocation_params, pattern_code, parent_qty=qty
+                )
+                
+                if mod_taxable_base > 0:
+                    taxable_bases.append({
+                        "type": "modifier",
+                        "item_id": mod.get("internalId", "unknown"),
+                        "item_name": mod.get("name", "Unknown Modifier"),
+                        "parent_item": item.get("name", "Unknown Item"),
+                        "taxable_amount": mod_taxable_base * qty,  # Apply parent qty
+                        "individual_rate_decimal": mod_tax_rate / 100.0,
+                        "total_rate_decimal": self._get_total_tax_rate(mod, "decimal"),
+                        "parent_qty": qty
+                    })
+        
+        return taxable_bases
+    
+    def _get_discount_allocation_params(self, order_data: Dict[str, Any], pattern_code: int) -> Dict[str, Any]:
+        """Get discount allocation parameters based on pattern for consistent calculation."""
+        payment_details = order_data.get("paymentDetails", {})
+        price_details = payment_details.get("priceDetails", {})
+        
+        params = {
+            "pattern_code": pattern_code,
+            "order_discount": self._get_order_level_discount(order_data),
+            "item_discounts": self._get_total_item_level_discounts(order_data),
+            "unit_price": float(price_details.get("unitPrice", 0.0)),
+            "calculated_subtotal": self._get_calculated_subtotal(order_data)
+        }
+        
+        # Calculate remaining order discount for Pattern 4
+        if pattern_code == 4:
+            params["remaining_order_discount"] = max(0.0, 
+                params["order_discount"] - params["item_discounts"]
+            )
+            params["post_item_subtotal"] = params["unit_price"] - params["item_discounts"]
+        else:
+            params["remaining_order_discount"] = 0.0
+            params["post_item_subtotal"] = 0.0
+        
+        return params
+    
+    def _calculate_item_taxable_amount(self, item_data: Dict[str, Any], 
+                                     allocation_params: Dict[str, Any], 
+                                     pattern_code: int, 
+                                     parent_qty: int = 1) -> float:
+        """
+        Calculate taxable amount DECOUPLED from database grossAmount/netAmount fields.
+        
+        This method calculates taxable amounts purely from core data:
+        - unitPrice × qty (base amount)
+        - discountAmount (item-level discount)  
+        - Discount pattern allocation logic
+        
+        Does NOT depend on potentially incorrect grossAmount/netAmount in database.
+        """
+        price_info = item_data.get("price", {})
+        unit_price = float(price_info.get("unitPrice", 0.0))
+        qty = int(item_data.get("qty", 1))
+        item_discount = float(price_info.get("discountAmount", 0.0))
+        
+        # Calculate base amount from core data (not from database grossAmount)
+        base_amount = unit_price * qty
+        
+        if pattern_code == 1:
+            # Pattern 1: No discounts - pure base amount
+            return base_amount
+            
+        elif pattern_code == 2:
+            # Pattern 2: Order-level discount proportional allocation
+            order_discount = allocation_params["order_discount"]
+            unit_price_total = allocation_params["unit_price"]  # Global unit price
+            
+            if order_discount > 0 and unit_price_total > 0:
+                # Allocate order discount proportionally
+                proportion = order_discount / unit_price_total
+                allocated_discount = proportion * base_amount
+                return base_amount - allocated_discount
+            else:
+                return base_amount
+                
+        elif pattern_code == 3:
+            # Pattern 3: Item-level discounts only
+            return base_amount - item_discount
+            
+        elif pattern_code == 4:
+            # Pattern 4: Combined discounts (two-stage)
+            # Step 1: Apply item-level discount
+            post_item_amount = base_amount - item_discount
+            
+            # Step 2: Apply residual order discount
+            remaining_order_discount = allocation_params["remaining_order_discount"]
+            post_item_subtotal = allocation_params["post_item_subtotal"]
+            
+            if remaining_order_discount > 0 and post_item_subtotal > 0:
+                proportion = remaining_order_discount / post_item_subtotal
+                allocated_residual = proportion * post_item_amount
+                return post_item_amount - allocated_residual
+            else:
+                return post_item_amount
+        
+        # Fallback: base minus item discount
+        return base_amount - item_discount
+    
+    def _normalize_id(self, obj_id) -> str:
+        """Normalize ObjectId or string ID to consistent string format."""
+        if obj_id is None:
+            return ""
+        # Convert ObjectId to string (gets hex representation)
+        return str(obj_id)
+    
+    def _get_item_tax_rate(self, item_data: Dict[str, Any], tax_id: str) -> float:
+        """Get tax rate for specific tax ID from item's taxes array or orderTaxes."""
+        # Normalize the target tax_id
+        normalized_tax_id = self._normalize_id(tax_id)
+        
+        # First check if item has this tax_id (without caring about rate)
+        has_tax_id = False
+        for tax_entry in item_data.get("taxes", []):
+            if self._normalize_id(tax_entry.get("taxId", "")) == normalized_tax_id:
+                has_tax_id = True
+                # Try to get rate from tax entry first
+                rate = tax_entry.get("rate")
+                if rate is not None:
+                    return float(rate)
+                break
+        
+        # If item doesn't have this tax_id, return 0
+        if not has_tax_id:
+            return 0.0
+        
+        # If item has tax_id but no rate, get rate from orderTaxes (decoupled approach)
+        if hasattr(self, '_current_order_data') and self._current_order_data:
+            for order_tax in self._current_order_data.get("orderTaxes", []):
+                order_tax_id = self._normalize_id(order_tax.get("_id", order_tax.get("taxId", "")))
+                if order_tax_id == normalized_tax_id:
+                    return float(order_tax.get("rate", order_tax.get("taxRate", 0.0)))
+        
+        return 0.0
+    
+    def _get_total_tax_rate(self, item_data: Dict[str, Any], format_type: str = "decimal") -> float:
+        """Calculate total tax rate for item (sum of all applicable tax rates)."""
+        total_rate = 0.0
+        
+        for tax_entry in item_data.get("taxes", []):
+            tax_id = self._normalize_id(tax_entry.get("taxId", ""))
+            rate = tax_entry.get("rate")
+            
+            if rate is not None:
+                total_rate += float(rate)
+            elif hasattr(self, '_current_order_data') and self._current_order_data:
+                # Get rate from orderTaxes (decoupled approach)
+                for order_tax in self._current_order_data.get("orderTaxes", []):
+                    order_tax_id = self._normalize_id(order_tax.get("_id", order_tax.get("taxId", "")))
+                    if order_tax_id == tax_id:
+                        total_rate += float(order_tax.get("rate", order_tax.get("taxRate", 0.0)))
+                        break
+        
+
+        
+        if format_type == "decimal":
+            return total_rate / 100.0
+        else:
+            return total_rate
+    
+    def _per_tax_component_breakdown(self, order_data: Dict[str, Any], tax_id: str) -> Dict[str, Any]:
+        """
+        Generate transparent per-tax component breakdown using r_j/(1+R) formula.
+        
+        This method provides detailed analysis of tax calculations for validation:
+        1. Lists all items/modifiers that contribute to this tax ID
+        2. Shows taxable amount derivation for each component based on discount pattern
+        3. Applies r_j/(1+R) formula with precision control for each component
+        4. Aggregates results with detailed breakdown for transparency
+        5. Compares with stored menuDetails tax amounts for validation
+        
+        Args:
+            order_data: Complete order data dictionary  
+            tax_id: Target tax ID for detailed breakdown
+            
+        Returns:
+            Dictionary containing detailed component analysis and validation
+        """
+        # Store order data for rate lookup (needed by _get_total_tax_rate)
+        self._current_order_data = order_data
+        
+        # Get tax rate and validate
+        rate_percent = self._get_tax_rate_by_id(order_data, tax_id)
+        if rate_percent <= 0:
+            return {
+                "tax_id": tax_id,
+                "rate_percent": 0.0,
+                "components": [],
+                "totals": {"expected": 0.0, "recomputed": 0.0, "variance": 0.0},
+                "validation": {"is_valid": True, "message": "No applicable tax rate found"}
+            }
+        
+        rate_decimal = rate_percent / 100.0
+        
+        # Get enhanced pattern information
+        pattern_info = self._validate_discount_consistency(order_data)
+        pattern_code = pattern_info["pattern_code"]
+        
+        # Get discount allocation parameters  
+        allocation_params = self._get_discount_allocation_params(order_data, pattern_code)
+        
+        components = []
+        total_expected = 0.0
+        total_recomputed = 0.0
+        
+        # Process each menu item
+        for item in order_data.get("menuDetails", []):
+            # Check if item has this tax_id and get expected amount
+            expected_item_tax = 0.0
+            for tax_entry in item.get("taxes", []):
+                if str(tax_entry.get("taxId", "")) == str(tax_id):
+                    expected_item_tax += float(tax_entry.get("amount", 0.0))
+            
+            if expected_item_tax > 0:
+                # Calculate recomputed tax for item
+                item_taxable = self._calculate_item_taxable_amount(item, allocation_params, pattern_code)
+                total_rate_R = self._get_total_tax_rate(item, "decimal")
+                
+                if item_taxable > 0 and total_rate_R > 0:
+                    recomputed_item_tax = self._r(item_taxable, rate_decimal, total_rate_R)
                 else:
-                    # Pattern 2: Apply order-level discount distribution
-                    if remaining_order_discount > 0:
-                        calculated_subtotal = self._get_calculated_subtotal(order_data)
-                        if calculated_subtotal > 0:
-                            distributed_order_discount = (remaining_order_discount / calculated_subtotal) * mprice
-                            mod_taxable_amount = mprice - distributed_order_discount
-                        else:
-                            mod_taxable_amount = mprice
-                    else:
-                        mod_taxable_amount = mprice
+                    recomputed_item_tax = 0.0
+                
+                # Build component detail
+                price_info = item.get("price", {})
+                component = {
+                    "type": "item",
+                    "item_id": item.get("internalId", "unknown"),
+                    "item_name": item.get("name", "Unknown Item"),
+                    "qty": int(item.get("qty", 1)),
+                    "unit_price": round(float(price_info.get("unitPrice", 0.0)), self.precision),
+                    "total_price": round(float(price_info.get("totalPrice", 0.0)), self.precision),
+                    "item_discount": round(float(price_info.get("discountAmount", 0.0)), self.precision),
+                    "taxable_amount": round(item_taxable, self.precision),
+                    "individual_rate_percent": rate_percent,
+                    "total_rate_percent": self._get_total_tax_rate(item, "percent"),
+                    "formula_components": {
+                        "r_j": rate_decimal,
+                        "R_total": total_rate_R,
+                        "r_j_over_1_plus_R": round(rate_decimal / (1.0 + total_rate_R), self.precision) if total_rate_R > 0 else 0.0
+                    },
+                    "expected_tax": expected_item_tax,  # Exact DB value
+                    "recomputed_tax": round(recomputed_item_tax, self.precision),
+                    "variance": round(expected_item_tax - recomputed_item_tax, self.precision),
+                    "pattern_details": self._get_component_pattern_details(item, allocation_params, pattern_code)
+                }
+                
+                components.append(component)
+                total_expected += expected_item_tax
+                total_recomputed += recomputed_item_tax
+            
+            # Process modifiers
+            qty = int(item.get("qty", 1))
+            for mod in item.get("extraDetails", []):
+                expected_mod_tax = 0.0
+                for tax_entry in mod.get("taxes", []):
+                    if str(tax_entry.get("taxId", "")) == str(tax_id):
+                        expected_mod_tax += float(tax_entry.get("amount", 0.0))
+                
+                if expected_mod_tax > 0:
+                    # Calculate recomputed tax for modifier (base calculation)
+                    mod_taxable_base = self._calculate_item_taxable_amount(mod, allocation_params, pattern_code)
+                    total_rate_R_mod = self._get_total_tax_rate(mod, "decimal")
                     
-                base = self._inclusive_tax(mod_taxable_amount, rate)
-                total += base * qty
-        return round(total, 5)
+                    if mod_taxable_base > 0 and total_rate_R_mod > 0:
+                        recomputed_mod_base = self._r(mod_taxable_base, rate_decimal, total_rate_R_mod)
+                        recomputed_mod_final = recomputed_mod_base * qty  # Apply parent quantity
+                    else:
+                        recomputed_mod_base = 0.0
+                        recomputed_mod_final = 0.0
+                    
+                    # Build modifier component detail
+                    mod_price_info = mod.get("price", {})
+                    mod_component = {
+                        "type": "modifier",
+                        "item_id": mod.get("internalId", "unknown"),
+                        "item_name": mod.get("name", "Unknown Modifier"),
+                        "parent_item": item.get("name", "Unknown Item"),
+                        "parent_qty": qty,
+                        "unit_price": round(float(mod_price_info.get("unitPrice", 0.0)), self.precision),
+                        "total_price": round(float(mod_price_info.get("totalPrice", 0.0)), self.precision),
+                        "modifier_discount": round(float(mod_price_info.get("discountAmount", 0.0)), self.precision),
+                        "taxable_amount_base": round(mod_taxable_base, self.precision),
+                        "taxable_amount_final": round(mod_taxable_base * qty, self.precision),
+                        "individual_rate_percent": rate_percent,
+                        "total_rate_percent": self._get_total_tax_rate(mod, "percent"),
+                        "formula_components": {
+                            "r_j": rate_decimal,
+                            "R_total": total_rate_R_mod,
+                            "r_j_over_1_plus_R": round(rate_decimal / (1.0 + total_rate_R_mod), self.precision) if total_rate_R_mod > 0 else 0.0
+                        },
+                        "expected_tax": expected_mod_tax,  # Exact DB value
+                        "recomputed_tax_base": round(recomputed_mod_base, self.precision),
+                        "recomputed_tax_final": round(recomputed_mod_final, self.precision),
+                        "variance": round(expected_mod_tax - recomputed_mod_base, self.precision),  # Compare to base
+                        "pattern_details": self._get_component_pattern_details(mod, allocation_params, pattern_code, parent_qty=qty)
+                    }
+                    
+                    components.append(mod_component)
+                    total_expected += expected_mod_tax
+                    total_recomputed += recomputed_mod_final
+        
+        # Aggregate totals and validation
+        total_variance = round(total_expected - total_recomputed, self.precision)
+        tolerance = 1.0 / self._precision_multiplier
+        is_valid = abs(total_variance) <= tolerance
+        
+        return {
+            "tax_id": tax_id,
+            "rate_percent": rate_percent,
+            "pattern_info": {
+                "pattern": pattern_info["pattern"],
+                "pattern_code": pattern_code,
+                "corrected": pattern_info.get("corrected_pattern", False)
+            },
+            "components": components,
+            "totals": {
+                "expected": total_expected,  # Exact sum of DB values
+                "recomputed": round(total_recomputed, self.precision),
+                "variance": total_variance
+            },
+            "validation": {
+                "is_valid": is_valid,
+                "tolerance": tolerance,
+                "message": "Tax calculation validation passed" if is_valid else f"Variance {total_variance} exceeds tolerance {tolerance}"
+            },
+            "formula_explanation": f"r_j/(1+R) where r_j={rate_percent}% (this tax) and R=sum of all applicable tax rates per item"
+        }
+    
+    def _get_component_pattern_details(self, item_data: Dict[str, Any], 
+                                     allocation_params: Dict[str, Any], 
+                                     pattern_code: int,
+                                     parent_qty: int = 1) -> Dict[str, Any]:
+        """Generate detailed pattern-specific calculation breakdown for transparency."""
+        price_info = item_data.get("price", {})
+        total_price = float(price_info.get("totalPrice", 0.0))
+        item_discount = float(price_info.get("discountAmount", 0.0))
+        
+        details = {
+            "pattern_code": pattern_code,
+            "gross_amount": round(total_price + item_discount, self.precision) if item_discount > 0 else round(total_price, self.precision),
+            "item_level_discount": round(item_discount, self.precision),
+            "post_item_amount": round(total_price, self.precision)
+        }
+        
+        if pattern_code == 1:
+            details.update({
+                "pattern_name": "No Discounts", 
+                "calculation": "taxable_amount = gross_amount",
+                "distributed_order_discount": 0.0,
+                "final_taxable": round(total_price, self.precision)
+            })
+            
+        elif pattern_code == 2:
+            order_discount = allocation_params["order_discount"]
+            calculated_subtotal = allocation_params["calculated_subtotal"]
+            
+            if order_discount > 0 and calculated_subtotal > 0:
+                distributed_discount = (order_discount / calculated_subtotal) * total_price
+            else:
+                distributed_discount = 0.0
+                
+            details.update({
+                "pattern_name": "Order-Level Discount Only",
+                "calculation": f"taxable_amount = total_price - (order_discount / subtotal) * total_price",
+                "order_discount_total": round(order_discount, self.precision),
+                "calculated_subtotal": round(calculated_subtotal, self.precision),
+                "proportion": round(order_discount / calculated_subtotal, self.precision) if calculated_subtotal > 0 else 0.0,
+                "distributed_order_discount": round(distributed_discount, self.precision),
+                "final_taxable": round(total_price - distributed_discount, self.precision)
+            })
+            
+        elif pattern_code == 3:
+            details.update({
+                "pattern_name": "Item-Level Discounts Only",
+                "calculation": "taxable_amount = total_price (already includes item discount)",
+                "distributed_order_discount": 0.0,
+                "final_taxable": round(total_price, self.precision)
+            })
+            
+        elif pattern_code == 4:
+            remaining_order_discount = allocation_params["remaining_order_discount"]
+            post_item_subtotal = allocation_params["post_item_subtotal"]
+            
+            if remaining_order_discount > 0 and post_item_subtotal > 0:
+                distributed_order_discount = (remaining_order_discount / post_item_subtotal) * total_price
+            else:
+                distributed_order_discount = 0.0
+                
+            details.update({
+                "pattern_name": "Combined Discounts",
+                "calculation": "taxable_amount = post_item_amount - (remaining_order_discount / post_item_subtotal) * post_item_amount",
+                "total_order_discount": round(allocation_params["order_discount"], self.precision),
+                "item_discounts_total": round(allocation_params["item_discounts"], self.precision),
+                "remaining_order_discount": round(remaining_order_discount, self.precision),
+                "post_item_subtotal": round(post_item_subtotal, self.precision),
+                "proportion": round(remaining_order_discount / post_item_subtotal, self.precision) if post_item_subtotal > 0 else 0.0,
+                "distributed_order_discount": round(distributed_order_discount, self.precision),
+                "final_taxable": round(total_price - distributed_order_discount, self.precision)
+            })
+        
+        # Apply parent quantity for modifiers
+        if parent_qty > 1:
+            details["parent_qty"] = parent_qty
+            details["final_taxable_with_qty"] = round(details["final_taxable"] * parent_qty, self.precision)
+        
+        return details
 
     def _build_details(self, order_data: Dict[str, Any], tax_id: str) -> Dict[str, Any]:
+        # Set current order data for tax rate lookups
+        self._current_order_data = order_data
         rate = self._get_tax_rate_by_id(order_data, tax_id)
         
         # Check discount types present
@@ -355,29 +857,46 @@ class OrderTaxVerifier:
                 else:
                     # Pattern 2: Apply order-level discount distribution
                     if remaining_order_discount > 0:
+                        # Use gross amount (unitPrice × qty) as the basis for discount distribution
+                        gross_amount = float(item.get("price", {}).get("unitPrice", 0.0)) * qty
                         calculated_subtotal = self._get_calculated_subtotal(order_data)
                         if calculated_subtotal > 0:
-                            distributed_order_discount = (remaining_order_discount / calculated_subtotal) * total_price
-                            taxable_amount = total_price - distributed_order_discount
+                            # Proportional discount: (order_discount / total_gross) × item_gross
+                            distributed_order_discount = (remaining_order_discount / calculated_subtotal) * gross_amount
+                            taxable_amount = gross_amount - distributed_order_discount
                         else:
                             distributed_order_discount = 0.0
-                            taxable_amount = total_price
+                            taxable_amount = gross_amount
                     else:
                         distributed_order_discount = 0.0
-                        taxable_amount = total_price
+                        taxable_amount = float(item.get("price", {}).get("unitPrice", 0.0)) * qty
                     
-                recomputed_item_tax = self._inclusive_tax(taxable_amount, rate)
+                # Use r_j/(1+R) formula for precise tax calculation
+                total_tax_rate = self._get_total_tax_rate(item, "percent")  # Get sum of all tax rates
+                if total_tax_rate > 0:
+                    individual_rate_decimal = rate / 100.0
+                    total_rate_decimal = total_tax_rate / 100.0
+                    recomputed_item_tax = self._r(taxable_amount, individual_rate_decimal, total_rate_decimal)
+                else:
+                    recomputed_item_tax = 0.0
                 recomputed_total += recomputed_item_tax
                 
+                # Prefer real Mongo _id if present. Some payloads may wrap _id like {"$oid": "..."}
+                raw_oid = item.get("_id")
+                if isinstance(raw_oid, dict) and "$oid" in raw_oid:
+                    raw_oid = raw_oid["$oid"]
+                preferred_id = raw_oid or item.get("_id") or item.get("internalId") or item.get("id")
                 items.append({
                     "name": item.get("name", "Unknown"),
+                    "item_id": preferred_id,
+                    "internal_id": item.get("internalId"),
                     "qty": qty,
                     "unit_price": round(float(item.get("price", {}).get("unitPrice", 0.0)), 5),
                     "total_price": round(total_price, 5),
                     "item_discount": round(item_discount, 5),
                     "distributed_order_discount": round(distributed_order_discount, 5),
                     "taxable_amount": round(taxable_amount, 5),
-                    "expected": expected_item_tax,  # Show exact DB value without rounding
+                    "expected": expected_item_tax,  # Exact DB value
                     "recomputed": round(recomputed_item_tax, 5),
                     "difference": round(expected_item_tax - recomputed_item_tax, 5),
                 })
@@ -416,8 +935,10 @@ class OrderTaxVerifier:
                     distributed_order_discount = 0.0
                     mod_taxable_amount = m_total
                 else:
-                    # Pattern 2: Apply order-level discount distribution
+                    # Pattern 2: Apply order-level discount distribution  
                     if remaining_order_discount > 0:
+                        # For modifiers in Pattern 2, use the modifier's totalPrice as basis
+                        # since modifiers don't have separate unitPrice × qty structure like items
                         calculated_subtotal = self._get_calculated_subtotal(order_data)
                         if calculated_subtotal > 0:
                             distributed_order_discount = (remaining_order_discount / calculated_subtotal) * m_total
@@ -429,7 +950,14 @@ class OrderTaxVerifier:
                         distributed_order_discount = 0.0
                         mod_taxable_amount = m_total
                     
-                base_tax = self._inclusive_tax(mod_taxable_amount, rate)
+                # Use r_j/(1+R) formula for precise modifier tax calculation
+                mod_total_tax_rate = self._get_total_tax_rate(mod, "percent")  # Get sum of all tax rates
+                if mod_total_tax_rate > 0:
+                    individual_rate_decimal = rate / 100.0
+                    total_rate_decimal = mod_total_tax_rate / 100.0
+                    base_tax = self._r(mod_taxable_amount, individual_rate_decimal, total_rate_decimal)
+                else:
+                    base_tax = 0.0
                 final_tax = base_tax * qty
                 
                 # Only add to recomputed_total if there's actual expected tax
@@ -438,7 +966,9 @@ class OrderTaxVerifier:
                 
                 modifiers.append({
                     "name": mod.get("name", "Unknown"),
+                    "modifier_id": mod.get("internalId") or mod.get("_id") or mod.get("id"),
                     "parent_item": item.get("name", "Unknown"),
+                    "parent_item_id": item.get("internalId") or item.get("_id") or item.get("id"),
                     "parent_qty": qty,
                     "unit_price": round(float(mod.get("price", {}).get("unitPrice", 0.0)), 5),
                     "total_price": round(m_total, 5),
@@ -454,85 +984,328 @@ class OrderTaxVerifier:
         return {"items": items, "modifiers": modifiers, "recomputed_total": round(recomputed_total, 5)}
 
     def _inclusive_tax(self, total_price: float, rate_percent: float) -> float:
-        # Same as Basic approach but explicit for inclusivity
+        """
+        Calculate tax from inclusive amount with precision control.
+        
+        This method provides backward compatibility for existing code while
+        maintaining precision consistency. For new calculations, prefer the
+        enhanced _r() method with r_j/(1+R) formula.
+        
+        Args:
+            total_price: Tax-inclusive amount
+            rate_percent: Tax rate as percentage (e.g., 5.0 for 5%)
+            
+        Returns:
+            Tax amount rounded to specified precision
+        """
         if rate_percent <= 0 or total_price <= 0:
             return 0.0
         rate = rate_percent / 100.0
         tax = total_price - (total_price / (1.0 + rate))
-        return round(tax, 5)
+        return round(tax, self.precision)
 
     def _validate_discount_consistency(self, order_data: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Validate whether the discount pattern is consistent between item and order levels.
+        Enhanced discount pattern validation with precision-aware tolerance handling.
+        
+        This method determines the correct discount pattern (1-4) and validates consistency
+        between item-level and order-level discounts with improved tolerance thresholds.
         
         Returns a dictionary with:
         - is_valid: Boolean indicating if discounts are consistent
         - pattern: The determined discount pattern (corrected if needed)
+        - pattern_code: Numeric pattern code (1-4) for programmatic use
         - warning: Warning message if inconsistent
         - item_discounts: Total item-level discounts
         - order_discount: Order-level discount
-        - corrected_pattern: True if pattern was corrected from the original determination
+        - tolerance_used: The tolerance threshold applied
+        - corrected_pattern: True if pattern was corrected from initial determination
         """
         has_item_discounts = self._has_item_level_discounts(order_data)
         order_discount = self._get_order_level_discount(order_data)
         item_discounts = self._get_total_item_level_discounts(order_data)
         
+        # Precision-aware tolerance: use 1/precision_multiplier as base tolerance
+        base_tolerance = 1.0 / self._precision_multiplier
+        relative_tolerance = 0.05  # 5% relative tolerance for pattern reclassification
+        
         # Initial pattern determination
-        if has_item_discounts and order_discount > 0:
+        if has_item_discounts and order_discount > base_tolerance:
             initial_pattern = "Pattern 4: Combined (Item + Order Level Discounts)"
+            pattern_code = 4
         elif has_item_discounts:
             initial_pattern = "Pattern 3: Item-Level Discounts Only"
-        elif order_discount > 0:
+            pattern_code = 3
+        elif order_discount > base_tolerance:
             initial_pattern = "Pattern 2: Order-Level Discount Only"
+            pattern_code = 2
         else:
             initial_pattern = "Pattern 1: No Discounts"
+            pattern_code = 1
             
         # Start with pattern matching the initial determination
         pattern = initial_pattern
+        final_pattern_code = pattern_code
         is_valid = True
         warning = None
         corrected_pattern = False
+        tolerance_used = base_tolerance
         
-        # CASE 1: Detect when Pattern 4 should actually be Pattern 3
-        # If order discount is suspiciously close to item discounts, it's likely a duplicated Pattern 3
-        if initial_pattern == "Pattern 4: Combined (Item + Order Level Discounts)":
-            # If order_discount is approximately equal to item_discounts (within 5%)
-            if abs(order_discount - item_discounts) / max(0.01, item_discounts) < 0.05:
-                # This is actually correct for Pattern 3 - just reclassify without warning
-                pattern = "Pattern 3: Item-Level Discounts Only"  # Correct the pattern
+        # Enhanced Pattern 4 → Pattern 3 reclassification logic
+        if pattern_code == 4:
+            discount_diff = abs(order_discount - item_discounts)
+            # Use both absolute and relative tolerance for robust classification
+            if (discount_diff <= base_tolerance or 
+                (item_discounts > base_tolerance and discount_diff / item_discounts < relative_tolerance)):
+                
+                pattern = "Pattern 3: Item-Level Discounts Only"
+                final_pattern_code = 3
                 corrected_pattern = True
+                tolerance_used = max(base_tolerance, discount_diff)
                 warning = (
-                    f"NOTE: Reclassified from Pattern 4 to Pattern 3.\n"
-                    f"Order discount (${order_discount:.5f}) equals item discounts (${item_discounts:.5f}), indicating item-level discounts only."
+                    f"RECLASSIFIED: Pattern 4 → Pattern 3 (discount duplication detected)\n"
+                    f"Order discount ({order_discount:.{self.precision}f}) ≈ item discounts ({item_discounts:.{self.precision}f})\n"
+                    f"Difference: {discount_diff:.{self.precision}f} (within tolerance: {tolerance_used:.{self.precision}f})"
                 )
         
-        # CASE 2: Verify Pattern 3 is used correctly
-        # For Pattern 3, order discount should be 0 or equal to sum of item discounts
-        elif initial_pattern == "Pattern 3: Item-Level Discounts Only" and order_discount > 0.001:
-            # If order discount equals item discounts, it's correct but redundant
-            if abs(order_discount - item_discounts) < 0.01:
+        # Enhanced Pattern 3 validation with precision-aware thresholds
+        elif pattern_code == 3 and order_discount > base_tolerance:
+            discount_diff = abs(order_discount - item_discounts)
+            
+            if discount_diff <= base_tolerance:
+                # Acceptable redundancy - order discount equals item discounts
                 warning = (
-                    f"NOTE: Pattern 3 detected with order discount ({order_discount:.5f}) equal to item discounts ({item_discounts:.5f}).\n"
-                    f"This is technically correct but redundant - for cleaner data, consider setting order discount to 0."
+                    f"REDUNDANCY: Pattern 3 with redundant order discount\n"
+                    f"Order discount ({order_discount:.{self.precision}f}) = item discounts ({item_discounts:.{self.precision}f})\n"
+                    f"Consider removing redundant order discount for cleaner data"
                 )
-            # Otherwise, there's an inconsistency
+            elif discount_diff / max(item_discounts, base_tolerance) < relative_tolerance:
+                # Within relative tolerance - likely rounding differences
+                tolerance_used = discount_diff
+                warning = (
+                    f"TOLERANCE: Pattern 3 with minor order discount variance\n"
+                    f"Order discount ({order_discount:.{self.precision}f}) vs item discounts ({item_discounts:.{self.precision}f})\n"
+                    f"Difference: {discount_diff:.{self.precision}f} (within relative tolerance: {relative_tolerance*100:.1f}%)"
+                )
             else:
+                # Significant inconsistency
                 is_valid = False
                 warning = (
-                    f"WARNING: Item-Level Total Discounts Calculation Issue.\n" 
-                    f"Item-level total discounts: ${item_discounts:.5f}, but paymentDetails.priceDetails.discountAmount: ${order_discount:.5f}.\n"
-                    f"This may indicate an issue with the order payload or discount calculation logic."
+                    f"ERROR: Pattern 3 discount calculation inconsistency\n"
+                    f"Item-level discounts: {item_discounts:.{self.precision}f}\n"
+                    f"Order-level discount: {order_discount:.{self.precision}f}\n"
+                    f"Difference: {discount_diff:.{self.precision}f} exceeds tolerance ({base_tolerance:.{self.precision}f})\n"
+                    f"This indicates a potential data integrity issue"
                 )
         
         return {
             "is_valid": is_valid,
             "pattern": pattern,
+            "pattern_code": final_pattern_code,
             "warning": warning,
-            "item_discounts": item_discounts,
-            "order_discount": order_discount,
+            "item_discounts": round(item_discounts, self.precision),
+            "order_discount": round(order_discount, self.precision),
+            "tolerance_used": tolerance_used,
             "corrected_pattern": corrected_pattern,
-            "initial_pattern": initial_pattern
+            "initial_pattern": initial_pattern,
+            "initial_pattern_code": pattern_code
         }
+    
+    def diagnose_tax_failures(self, order_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Diagnose common causes of taxAmount failures in menuDetails.taxes[i].
+        
+        This method analyzes the order data to identify specific issues that cause
+        tax calculation mismatches and provides actionable debugging information.
+        
+        Returns:
+            Dictionary containing diagnostic results and recommendations
+        """
+        diagnosis = {
+            "issues_found": [],
+            "warnings": [],
+            "recommendations": [],
+            "data_quality": {},
+            "calculation_details": {}
+        }
+        
+        # 1. Check for missing tax rate information
+        menu_tax_ids = set()
+        order_tax_ids = set()
+        
+        # Collect all tax IDs from menuDetails
+        for item in order_data.get("menuDetails", []):
+            for tax_info in item.get("taxes", []):
+                if "taxId" in tax_info:
+                    menu_tax_ids.add(str(tax_info["taxId"]))
+            for mod in item.get("extraDetails", []):
+                for tax_info in mod.get("taxes", []):
+                    if "taxId" in tax_info:
+                        menu_tax_ids.add(str(tax_info["taxId"]))
+        
+        # Collect all tax IDs from orderTaxes
+        for order_tax in order_data.get("orderTaxes", []):
+            tax_id = str(order_tax.get("_id", order_tax.get("taxId", "")))
+            if tax_id:
+                order_tax_ids.add(tax_id)
+        
+        # Find missing rates
+        missing_rates = menu_tax_ids - order_tax_ids
+        if missing_rates:
+            diagnosis["issues_found"].append({
+                "type": "missing_tax_rates",
+                "description": "Tax IDs found in menuDetails but missing in orderTaxes",
+                "tax_ids": list(missing_rates),
+                "severity": "HIGH",
+                "impact": "Tax calculations will return 0.0 for these tax IDs"
+            })
+        
+        # 2. Check discount pattern consistency
+        try:
+            pattern_info = self._validate_discount_consistency(order_data)
+            if not pattern_info["is_valid"]:
+                diagnosis["issues_found"].append({
+                    "type": "discount_pattern_inconsistency",
+                    "description": "Discount allocation pattern is inconsistent",
+                    "pattern": pattern_info["pattern"],
+                    "warning": pattern_info.get("warning"),
+                    "severity": "MEDIUM",
+                    "impact": "Taxable amounts may be calculated incorrectly"
+                })
+            
+            if pattern_info.get("corrected_pattern"):
+                diagnosis["warnings"].append({
+                    "type": "pattern_reclassification",
+                    "description": f"Pattern auto-corrected: {pattern_info['initial_pattern']} → {pattern_info['pattern']}",
+                    "reason": "Discount duplication detected"
+                })
+        except Exception as e:
+            diagnosis["issues_found"].append({
+                "type": "pattern_detection_error",
+                "description": f"Failed to analyze discount pattern: {str(e)}",
+                "severity": "HIGH"
+            })
+        
+        # 3. Analyze data quality issues
+        total_items = 0
+        items_with_taxes = 0
+        empty_tax_arrays = 0
+        missing_amounts = 0
+        zero_amounts = 0
+        
+        for item in order_data.get("menuDetails", []):
+            total_items += 1
+            taxes = item.get("taxes", [])
+            
+            if not taxes:
+                empty_tax_arrays += 1
+            else:
+                items_with_taxes += 1
+                for tax_info in taxes:
+                    amount = tax_info.get("amount")
+                    if amount is None:
+                        missing_amounts += 1
+                    elif amount == 0.0:
+                        zero_amounts += 1
+        
+        diagnosis["data_quality"] = {
+            "total_items": total_items,
+            "items_with_taxes": items_with_taxes,
+            "empty_tax_arrays": empty_tax_arrays,
+            "missing_tax_amounts": missing_amounts,
+            "zero_tax_amounts": zero_amounts,
+            "tax_coverage_percent": round((items_with_taxes / max(total_items, 1)) * 100, 2)
+        }
+        
+        # Flag quality issues
+        if empty_tax_arrays > 0:
+            diagnosis["warnings"].append({
+                "type": "empty_tax_arrays",
+                "description": f"{empty_tax_arrays} items have no tax assignments",
+                "impact": "These items will not contribute to tax calculations"
+            })
+        
+        # 4. Check for calculation variances
+        precision_issues = []
+        total_variance = 0.0
+        
+        try:
+            for tax_id in menu_tax_ids:
+                if tax_id in order_tax_ids:
+                    expected = self._sum_expected_menu_tax(order_data, tax_id)
+                    recomputed = self._recompute_menu_tax(order_data, tax_id)
+                    variance = abs(expected - recomputed)
+                    total_variance += variance
+                    
+                    if variance > 0:
+                        # Classify variance severity
+                        if variance >= 0.1:
+                            severity = "HIGH"
+                        elif variance >= 0.01:
+                            severity = "MEDIUM"  
+                        else:
+                            severity = "LOW"
+                            
+                        precision_issues.append({
+                            "tax_id": tax_id,
+                            "expected": round(expected, self.precision),
+                            "recomputed": round(recomputed, self.precision),
+                            "variance": round(variance, self.precision + 2),
+                            "severity": severity
+                        })
+        except Exception as e:
+            diagnosis["issues_found"].append({
+                "type": "calculation_error",
+                "description": f"Error during tax calculation: {str(e)}",
+                "severity": "HIGH"
+            })
+        
+        if precision_issues:
+            diagnosis["calculation_details"]["variances"] = precision_issues
+            diagnosis["calculation_details"]["total_variance"] = round(total_variance, self.precision + 2)
+            
+            # Flag high variances
+            high_variances = [p for p in precision_issues if p["severity"] == "HIGH"]
+            if high_variances:
+                diagnosis["issues_found"].append({
+                    "type": "high_calculation_variance",
+                    "description": "Significant differences between expected and recomputed taxes",
+                    "affected_taxes": [p["tax_id"] for p in high_variances],
+                    "severity": "HIGH",
+                    "impact": "Tax calculations are likely incorrect"
+                })
+        
+        # 5. Generate specific recommendations
+        if missing_rates:
+            diagnosis["recommendations"].append("🔧 Add missing tax rates to orderTaxes array")
+            diagnosis["recommendations"].append(f"   Missing tax IDs: {', '.join(list(missing_rates)[:5])}")
+        
+        if empty_tax_arrays > 0:
+            diagnosis["recommendations"].append(f"📋 Review {empty_tax_arrays} items with empty tax arrays - ensure tax categories are assigned")
+        
+        if pattern_info and pattern_info.get("corrected_pattern"):
+            diagnosis["recommendations"].append("💰 Clean up redundant discount data to avoid pattern reclassification")
+        
+        if precision_issues:
+            high_count = len([p for p in precision_issues if p["severity"] == "HIGH"])
+            if high_count > 0:
+                diagnosis["recommendations"].append(f"🎯 Investigate {high_count} tax calculation(s) with high variance")
+            diagnosis["recommendations"].append(f"🔢 Test with higher precision: --precision {min(8, self.precision + 2)}")
+        
+        # 6. Add diagnostic commands for debugging
+        diagnosis["debug_commands"] = [
+            "# Test with enhanced precision",
+            f"python -m smart_cal.cli verify-order --order-id <ORDER_ID> --precision {min(8, self.precision + 2)} --verbose",
+            "",
+            "# View detailed component breakdown", 
+            "python -m smart_cal.cli verify-order --order-id <ORDER_ID> --tax-view full",
+            "",
+            "# Test precision sensitivity",
+            "python -m smart_cal.cli verify-order --order-id <ORDER_ID> --precision 3",
+            "python -m smart_cal.cli verify-order --order-id <ORDER_ID> --precision 8"
+        ]
+        
+        return diagnosis
         
     def _determine_pattern(self, order_data: Dict[str, Any]) -> str:
         """Determine which discount pattern applies to this order."""
@@ -585,6 +1358,9 @@ class OrderTaxVerifier:
             # build per-item/modifier details and recompute reference from them
             details = self._build_details(order_data, tax_id)
             recomputed = details["recomputed_total"]
+            
+            # Generate enhanced component breakdown for detailed analysis
+            component_breakdown = self._per_tax_component_breakdown(order_data, tax_id)
             if order_amount == 0.0 and recomputed > 0.0:
                 # Use recomputed as order reference when missing in order data
                 order_amount = recomputed
@@ -605,6 +1381,13 @@ class OrderTaxVerifier:
                         "items": details["items"],
                         "modifiers": details["modifiers"],
                     },
+                    "component_breakdown": component_breakdown,
+                    "enhanced_analysis": {
+                        "precision_used": self.precision,
+                        "formula": "r_j/(1+R)",
+                        "pattern_applied": component_breakdown.get("pattern_info", {}).get("pattern", "Unknown"),
+                        "validation_status": component_breakdown.get("validation", {}).get("is_valid", False)
+                    }
                 }
             )
 
@@ -761,7 +1544,11 @@ class OrderTaxVerifier:
         if food_agg_val is not None:
             summary["foodAggragetorId"] = str(food_agg_val)
 
-        return {"comparisons": comparisons, "summary": summary}
+        return {
+            "comparisons": comparisons, 
+            "summary": summary,
+            "orderTaxes": order_data.get("orderTaxes", [])  # Include orderTaxes for CLI validation
+        }
 
     # ---------------------------------------------------------------------
     # New integrity check: Validate menuDetails price calculations
@@ -901,7 +1688,13 @@ class OrderTaxVerifier:
             nonlocal total_items, validation_details, calculation_errors
             
             item_name = item_data.get("name", "Unknown Item")
-            item_id = item_data.get("internalId", item_data.get("_id", "Unknown ID"))
+            # Prefer Mongo _id (ObjectId) over internalId for display; normalize {'$oid': ...} shape
+            raw_oid = item_data.get("_id")
+            if isinstance(raw_oid, dict) and "$oid" in raw_oid:
+                raw_oid = raw_oid["$oid"]
+            preferred_oid = raw_oid if raw_oid else None
+            # Keep legacy internalId as fallback
+            item_id = preferred_oid or item_data.get("internalId") or item_data.get("id") or "Unknown ID"
             qty = item_data.get("qty", 1)
             price = item_data.get("price", {})
             taxes = item_data.get("taxes", [])
@@ -946,6 +1739,13 @@ class OrderTaxVerifier:
             # Pattern-aware expected calculations
             expected_gross_amount = unit_price * qty
             is_taxed = (tax_amount > 0.0 or tax_exclusive_unit_price != unit_price or total_tax_rate > 0.0)
+            
+            # Fix for database inconsistency: if grossAmount is 0 but should be calculated
+            if gross_amount == 0.0 and unit_price > 0:
+                # Database might not store grossAmount, use calculated value for validation
+                expected_gross_amount_for_validation = expected_gross_amount
+            else:
+                expected_gross_amount_for_validation = expected_gross_amount
             
             if not is_taxed:
                 # Tax-free item logic (pattern-aware for net & totalPrice)
@@ -994,11 +1794,12 @@ class OrderTaxVerifier:
                     expected_net_amount = gross_amount - discount_amount
 
                 # totalPrice should always reflect discount for discounted tax-free items
-                expected_total_price = gross_amount - discount_amount
+                effective_gross_amount_tax_free = gross_amount if gross_amount > 0 else expected_gross_amount
+                expected_total_price = effective_gross_amount_tax_free - discount_amount
                 if discount_amount == 0:
-                    total_price_formula = f"grossAmount({gross_amount}) (tax-free, no discounts)"
+                    total_price_formula = f"unitPrice*qty({effective_gross_amount_tax_free}) (tax-free, no discounts)"
                 else:
-                    total_price_formula = f"grossAmount({gross_amount}) - discountAmount({discount_amount}) (tax-free)"
+                    total_price_formula = f"unitPrice*qty({effective_gross_amount_tax_free}) - discountAmount({discount_amount}) (tax-free)"
             else:
                 # Tax-inclusive item logic with pattern awareness
                 if tax_rate_decimal > 0:
@@ -1015,33 +1816,43 @@ class OrderTaxVerifier:
                 global_discount_inclusive = float(price_details.get("discountAmount", 0))  # total (item + order) inclusive discount
                 global_tax_excl_discount_total = float(price_details.get("taxExclusiveDiscountAmount", 0))
 
+                # DECOUPLED TAX CALCULATION: Calculate taxable amount directly from core data
+                # Don't depend on grossAmount/netAmount which might be incorrect in DB
+                base_amount = unit_price * qty  # Always calculate from core data
+                
                 if "Pattern 1" in discount_context:
-                    taxable_amount = gross_amount
+                    # No discounts: taxable = unitPrice × qty
+                    taxable_amount = base_amount
                 elif "Pattern 2" in discount_context:
-                    # Order-level only: proportional on gross
-                    proportion = (global_discount_inclusive / global_unit_price) if (global_unit_price > 0 and global_discount_inclusive > 0) else 0.0
-                    weighted_discount_inclusive = proportion * gross_amount
-                    taxable_amount = gross_amount - weighted_discount_inclusive
+                    # Order-level discount: proportional allocation
+                    if global_unit_price > 0 and global_discount_inclusive > 0:
+                        proportion = global_discount_inclusive / global_unit_price
+                        allocated_discount = proportion * base_amount
+                        taxable_amount = base_amount - allocated_discount
+                    else:
+                        taxable_amount = base_amount
                 elif "Pattern 3" in discount_context:
-                    # Item-level only
-                    taxable_amount = gross_amount - discount_amount
+                    # Item-level discount: subtract from base amount
+                    taxable_amount = base_amount - discount_amount
                 elif "Pattern 4" in discount_context:
-                    # Combined: item-level + allocated order-level share (inclusive)
-                    # Unified residual allocation: denominator = global_unit_price - total_item_level_discount_sum.
-                    # This represents the post-item-discount tax-inclusive base across all lines (items + modifiers).
-                    order_level_inclusive_component = max(global_discount_inclusive - total_item_level_discount_sum, 0.0)
-                    allocated_order_inclusive_share = 0.0
-                    if order_level_inclusive_component > 0:
-                        denom_post_item_discount = max(global_unit_price - total_item_level_discount_sum, 0.0)
-                        if denom_post_item_discount > 0:
-                            allocated_order_inclusive_share = order_level_inclusive_component * (max(gross_amount - discount_amount, 0.0) / denom_post_item_discount)
-                        elif total_menu_gross > 0:
-                            # Fallback: gross-based
-                            allocated_order_inclusive_share = order_level_inclusive_component * (gross_amount / total_menu_gross)
-                    combined_inclusive_discount = discount_amount + allocated_order_inclusive_share
-                    taxable_amount = gross_amount - combined_inclusive_discount
+                    # Combined: item-level + residual order-level allocation
+                    # Step 1: Apply item-level discount
+                    post_item_amount = base_amount - discount_amount
+                    
+                    # Step 2: Calculate residual order discount allocation
+                    residual_order_discount = max(global_discount_inclusive - total_item_level_discount_sum, 0.0)
+                    if residual_order_discount > 0:
+                        post_item_total = max(global_unit_price - total_item_level_discount_sum, 0.0)
+                        if post_item_total > 0:
+                            allocated_residual = residual_order_discount * (post_item_amount / post_item_total)
+                            taxable_amount = post_item_amount - allocated_residual
+                        else:
+                            taxable_amount = post_item_amount
+                    else:
+                        taxable_amount = post_item_amount
                 else:
-                    taxable_amount = gross_amount - discount_amount
+                    # Fallback: base amount minus any discount
+                    taxable_amount = base_amount - discount_amount
                 
                 # Calculate expected tax amount using inclusive-tax reverse calculation
                 if tax_rate_decimal > 0:
@@ -1089,23 +1900,22 @@ class OrderTaxVerifier:
                 else:  # Pattern 1
                     expected_net_amount = expected_tax_exclusive_gross - expected_tax_exclusive_discount
                 # Pattern-aware expected totalPrice
-                # Clarified rule: totalPrice always unitPrice*qty - discountAmount (regardless of pattern).
-                expected_total_price = gross_amount - discount_amount
+                # Use effective gross amount for calculation when DB grossAmount is 0
+                effective_gross_amount = gross_amount if gross_amount > 0 else expected_gross_amount
+                expected_total_price = effective_gross_amount - discount_amount
                 if discount_amount == 0:
-                    total_price_formula = f"grossAmount({gross_amount}) (no discounts)"
+                    total_price_formula = f"unitPrice*qty({effective_gross_amount}) (no discounts)"
                 else:
-                    total_price_formula = f"grossAmount({gross_amount}) - discountAmount({discount_amount})"
+                    total_price_formula = f"unitPrice*qty({effective_gross_amount}) - discountAmount({discount_amount})"
             
-            # For Pattern 2 and Pattern 4, relax validation for netAmount only (not taxAmount)
-            # Previously both taxAmount and netAmount were relaxed which masked real tax variances.
+            # Use strict tolerance for all fields - fail anything that doesn't match expected
             pattern_adjusted_tolerance = tolerance
-            if "Pattern 2" in discount_context or "Pattern 4" in discount_context:
-                pattern_adjusted_tolerance = max(tolerance, 1.0)  # Allow up to $1 difference for net amount variance due to distribution
             tax_strict_tolerance = tolerance  # Always enforce strict tolerance for taxAmount
             
             # Validate calculations with pattern-aware tolerance
             item_validation = {
-                "item_id": item_id,
+                "_id": preferred_oid,  # expose canonical Mongo _id for CLI preference
+                "item_id": item_id,    # retain for backward compatibility / fallback
                 "item_name": item_name,
                 "item_type": item_type,
                 "qty": qty,
@@ -1114,9 +1924,15 @@ class OrderTaxVerifier:
                 "pattern_context": discount_context
             }
             
-            # Check each calculation with appropriate logic and tolerance
+            # Check each calculation with strict tolerance - fail anything that doesn't match expected
+            gross_tolerance = tolerance
+            gross_formula = f"unitPrice({unit_price}) × qty({qty})"
+            if gross_amount == 0.0 and expected_gross_amount > 0:
+                # Database doesn't store grossAmount - this should fail validation
+                gross_formula += " (DB stores 0, expected > 0 - VALIDATION FAILURE)"
+            
             calculations = [
-                ("grossAmount", gross_amount, expected_gross_amount, f"unitPrice({unit_price}) × qty({qty})", tolerance),
+                ("grossAmount", gross_amount, expected_gross_amount, gross_formula, gross_tolerance),
                 ("taxExclusiveUnitPrice", tax_exclusive_unit_price, expected_tax_exclusive_unit_price, 
                  f"unitPrice({unit_price})" if not is_taxed else f"unitPrice({unit_price}) ÷ (1 + {tax_rate_decimal:.5f}) = {expected_tax_exclusive_unit_price:.5f}", tolerance),
                 ("taxExclusiveDiscountAmount", tax_exclusive_discount_amount, expected_tax_exclusive_discount,
@@ -1470,10 +2286,22 @@ class OrderTaxVerifier:
 
         # Helper to extract a candidate key
         def extract_key(obj: Dict[str, Any]):
-            for k in ("internalId", "_id", "id"):
+            """Return a stable identifier preferring Mongo _id over internalId.
+
+            Order of precedence:
+              1. _id (supports {'$oid': '...'} shape)
+              2. internalId
+              3. id
+              4. NAME::name fallback (non‑unique)
+            """
+            raw_oid = obj.get("_id")
+            if isinstance(raw_oid, dict) and "$oid" in raw_oid:
+                raw_oid = raw_oid["$oid"]
+            if raw_oid not in (None, ""):
+                return str(raw_oid)
+            for k in ("internalId", "id"):
                 if k in obj and obj.get(k) not in (None, ""):
                     return str(obj.get(k))
-            # Fallback to name (may not be unique)
             return f"NAME::{obj.get('name', '')}"
 
         # Helper to extract price field from menuDetails.price structure
@@ -1527,13 +2355,19 @@ class OrderTaxVerifier:
             # Key pattern: parentKey||mod||modifierInternalId (fallback to name)
             for mod in _get_modifiers(m):
                 mod_key_base = extract_key(m)
-                mod_id = None
-                for k in ("internalId", "_id", "id"):
-                    if k in mod and mod.get(k) not in (None, ""):
-                        mod_id = str(mod.get(k))
-                        break
-                if not mod_id:
-                    mod_id = f"NAME::{mod.get('name','')}"
+                # Prefer modifier _id similarly
+                raw_mod_oid = mod.get("_id")
+                if isinstance(raw_mod_oid, dict) and "$oid" in raw_mod_oid:
+                    raw_mod_oid = raw_mod_oid["$oid"]
+                if raw_mod_oid not in (None, ""):
+                    mod_id = str(raw_mod_oid)
+                else:
+                    for k in ("internalId", "id"):
+                        if k in mod and mod.get(k) not in (None, ""):
+                            mod_id = str(mod.get(k))
+                            break
+                    else:
+                        mod_id = f"NAME::{mod.get('name','')}"
                 composite_key = f"{mod_key_base}||mod||{mod_id}"
                 # Store enriched modifier object with parent linkage flags
                 mod_enriched = dict(mod)
@@ -1546,13 +2380,18 @@ class OrderTaxVerifier:
             # Index itemDetails modifiers if present for potential comparison
             for mod in _get_modifiers(it):
                 mod_key_base = key
-                mod_id = None
-                for k in ("internalId", "_id", "id"):
-                    if k in mod and mod.get(k) not in (None, ""):
-                        mod_id = str(mod.get(k))
-                        break
-                if not mod_id:
-                    mod_id = f"NAME::{mod.get('name','')}"
+                raw_mod_oid = mod.get("_id")
+                if isinstance(raw_mod_oid, dict) and "$oid" in raw_mod_oid:
+                    raw_mod_oid = raw_mod_oid["$oid"]
+                if raw_mod_oid not in (None, ""):
+                    mod_id = str(raw_mod_oid)
+                else:
+                    for k in ("internalId", "id"):
+                        if k in mod and mod.get(k) not in (None, ""):
+                            mod_id = str(mod.get(k))
+                            break
+                    else:
+                        mod_id = f"NAME::{mod.get('name','')}"
                 composite_key = f"{mod_key_base}||mod||{mod_id}"
                 mod_enriched = dict(mod)
                 mod_enriched["__is_modifier__"] = True
@@ -1609,8 +2448,13 @@ class OrderTaxVerifier:
             total_compared += 1
             
             # Collect detailed field information for this item
+            # Extract canonical _id for display if present
+            raw_display_oid = m_entry.get("_id")
+            if isinstance(raw_display_oid, dict) and "$oid" in raw_display_oid:
+                raw_display_oid = raw_display_oid["$oid"]
             item_detail = {
                 "key": key,
+                "_id": raw_display_oid if raw_display_oid not in (None, "") else None,
                 "name": m_entry.get("name", "Unknown Item"),
                 "fields": {},
                 "is_modifier": bool(m_entry.get("__is_modifier__")),
