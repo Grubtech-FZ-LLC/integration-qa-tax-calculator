@@ -2151,7 +2151,9 @@ class OrderTaxVerifier:
         total_ok = abs(expected_total - stored_total_price) <= tolerance
 
         sum_order_taxes = sum(float(t.get("amount", 0.0) or 0.0) for t in order_taxes)
-        tax_total_ok = abs(sum_order_taxes - stored_tax_amount) <= tolerance
+        tax_variance = abs(sum_order_taxes - stored_tax_amount)
+        # Apply new precision rules: 3-5 decimal precision (< 1e-3) should PASS with WARNING
+        tax_total_ok = tax_variance < 1e-3  # Accept 3-5 decimal precision as valid
 
         order_tax_map: Dict[str, float] = {}
         for ot in order_taxes:

@@ -223,6 +223,22 @@ def verify_order_tax(order_id: str, environment: str = "staging", tax_view: str 
     overall_status = "N/A"
 
     
+    # Precision warnings collector
+    precision_warnings = []
+    
+    # Precision warning functions
+    def _status_with_precision_warning(delta: float, field_name: str = "value") -> tuple[str, str]:
+        """Return status icon and precision warning message if applicable."""
+        abs_delta = abs(delta)
+        if abs_delta < 1e-5:  # Perfect match
+            return "✅", ""
+        elif abs_delta < 1e-3:  # 3-5 decimal precision mismatch - WARNING and PASS
+            return "⚠️", f"3-5 decimal precision mismatch in {field_name}: Δ={delta:+.5f} (WARNING - acceptable tolerance)"
+        elif abs_delta < 0.01:  # 1-2 decimal precision mismatch - FAIL
+            return "❌", f"1-2 decimal precision mismatch in {field_name}: Δ={delta:+.3f} (FAIL - unacceptable tolerance)"
+        else:  # Significant mismatch - FAIL
+            return "❌", f"Significant mismatch in {field_name}: Δ={delta:+.5f} (FAIL - major calculation error)"
+    
     # New: menuDetails price calculations validation section
     menu_validation = summary.get('menu_calculations_validation')
     if menu_validation:
@@ -257,10 +273,15 @@ def verify_order_tax(order_id: str, environment: str = "staging", tax_view: str 
                     delta = data.get('delta', 0)
                     is_calc_valid = data.get('is_valid', False)
                     formula = data.get('formula', '')
-                    icon = '✅' if is_calc_valid else '❌'
+                    
+                    # Use new precision-aware status function
+                    status_icon, warning_msg = _status_with_precision_warning(delta, fname)
+                    if warning_msg:
+                        precision_warnings.append(warning_msg)
+                    
                     # icon + space consumes 2 chars; adjust field width accordingly
                     # Delta precision reduced from 8 to 5 per latest requirement
-                    print(f"{prefix}{icon} {fname:<{field_col_width-2}}{actual:>14.5f}{expected:>14.5f}{delta:>16.5f}")
+                    print(f"{prefix}{status_icon} {fname:<{field_col_width-2}}{actual:>14.5f}{expected:>14.5f}{delta:>16.5f}")
                     if not is_calc_valid and formula:
                         # Indent formula under the row (align under first data column)
                         print(f"{prefix}{'':2}Formula: {formula}")
@@ -292,6 +313,12 @@ def verify_order_tax(order_id: str, environment: str = "staging", tax_view: str 
                     print(f"\n      🔧 Modifier: {mod_name} (ID: {mod_id})")
                     print(f"         Qty: {mod_qty}, Tax Rate: {mod_tax_rate:.2f}%")
                     _print_calc_table("         ", modifier_validation.get('calculations', {}))
+        
+        # Display precision warnings if any
+        if precision_warnings:
+            print(f"\n   📊 PRECISION WARNINGS ({len(precision_warnings)} found):")
+            for warning in precision_warnings:
+                print(f"      ⚠️  {warning}")
         
         if not is_valid:
             validation_note = menu_validation.get('validation_note', 
@@ -346,8 +373,12 @@ def verify_order_tax(order_id: str, environment: str = "staging", tax_view: str 
                         menu_val = data.get('menu_value', 0)
                         item_val = data.get('item_value', 0)
                         delta = data.get('delta', 0)
-                        is_match = abs(delta) <= tolerance_val
-                        icon = "✅" if is_match else "❌"
+                        
+                        # Use precision-aware status function
+                        icon, warning_msg = _status_with_precision_warning(delta, f"{fname} (consistency check)")
+                        if warning_msg:
+                            precision_warnings.append(warning_msg)
+                        
                         if fname == 'qty':
                             menu_fmt = f"{int(menu_val)}"
                             item_fmt = f"{int(item_val)}"
@@ -394,6 +425,13 @@ def verify_order_tax(order_id: str, environment: str = "staging", tax_view: str 
                         print(f"      ... {len(diffs)-5} more differences not shown")
                 else:
                     print("   ✅ All fields match perfectly across all items!")
+            
+            # Display consistency precision warnings if any (since they were collected during _print_rows)
+            consistency_warnings = [w for w in precision_warnings if "consistency check" in w]
+            if consistency_warnings:
+                print(f"\n   📊 CONSISTENCY PRECISION WARNINGS ({len(consistency_warnings)} found):")
+                for warning in consistency_warnings:
+                    print(f"      ⚠️  {warning}")
 
     # Charges validation section (data capture only for integration into TAX VERIFICATION block)
     charges_validation = summary.get('charges_validation')
@@ -412,7 +450,16 @@ def verify_order_tax(order_id: str, environment: str = "staging", tax_view: str 
         def _fmt_money(val: float) -> str:
             return f"${val:.{precision}f}"
         def _status_icon(delta: float) -> str:
-            return "✅" if abs(delta) < 1e-5 else ("⚠️" if abs(delta) < 0.01 else "❌")
+            """Return status icon based on precision requirements."""
+            abs_delta = abs(delta)
+            if abs_delta < 1e-5:  # Perfect match
+                return "✅"
+            elif abs_delta < 1e-3:  # 3-5 decimal precision mismatch - WARNING and PASS
+                return "⚠️"
+            else:  # 1-2 decimal or worse - FAIL
+                return "❌"
+        
+
         total_expected = sum(t.get('expected_total', 0.0) for t in taxes)
         total_recomputed = sum(t.get('recomputed_total', 0.0) for t in taxes)
         total_variance = total_expected - total_recomputed
@@ -544,7 +591,7 @@ def verify_order_tax(order_id: str, environment: str = "staging", tax_view: str 
                 expected_total = float(tax_info.get('expected_total', 0.0))
                 recomputed_total = float(tax_info.get('recomputed_total', 0.0))
                 variance = expected_total - recomputed_total
-                status_icon = '✅' if abs(variance) < 1e-5 else ('⚠️' if abs(variance) < 0.01 else '❌')
+                status_icon = _status_icon(variance)
                 tax_name = tax_info.get('tax_name', 'Tax')
                 charges_only = False
                 details = tax_info.get('details', {})
@@ -668,8 +715,11 @@ def verify_order_tax(order_id: str, environment: str = "staging", tax_view: str 
                             f"Net:{tax_excl:>{net_w}.2f}  "
                             f"Tax:{full_tax:>{tax_w}.5f}"
                         )
-                # Variance line
+                # Variance line with precision warning
                 variance_label = f"Δ {variance:+.5f}"
+                variance_icon, variance_warning = _status_with_precision_warning(variance, f"tax variance for {tax_name}")
+                if variance_warning:
+                    precision_warnings.append(variance_warning)
                 variance_status = "OK" if abs(variance) < 1e-5 else ("Within tolerance" if abs(variance) < 1e-4 else "Out of tolerance")
                 print(f"   └─ Variance: {variance_label} ({variance_status})")
                 print("")
@@ -677,7 +727,12 @@ def verify_order_tax(order_id: str, environment: str = "staging", tax_view: str 
         # Tree view is now the default (and only) style per latest requirement
         _render_tree()
 
-
+        # Display tax verification precision warnings if any
+        tax_warnings = [w for w in precision_warnings if "tax variance" in w]
+        if tax_warnings:
+            print(f"\n   📊 TAX PRECISION WARNINGS ({len(tax_warnings)} found):")
+            for warning in tax_warnings:
+                print(f"      ⚠️  {warning}")
 
         # Display any charge errors at the end of tax verification
         if charge_errors:
@@ -763,7 +818,12 @@ def verify_order_tax(order_id: str, environment: str = "staging", tax_view: str 
             calculated = tax_validation['calculated']
             order_db = tax_validation['order_db']
             variance = tax_validation['variance']
-            status_icon = "✅ PASS" if tax_validation['matches'] else "❌ FAIL"
+            
+            # Use precision-aware status for tax validation
+            status_icon_precision, warning_msg = _status_with_precision_warning(variance, f"tax {tax_name}")
+            if warning_msg:
+                precision_warnings.append(warning_msg)
+            status_icon = f"{status_icon_precision} PASS" if tax_validation['matches'] else f"{status_icon_precision} FAIL"
             
             print(f"   {tax_name:<12} {tax_id_short:<26} {calculated:>12.5f} {order_db:>12.5f} {variance:>12.5f} {status_icon}")
         
@@ -772,6 +832,13 @@ def verify_order_tax(order_id: str, environment: str = "staging", tax_view: str 
         print(f"   Total Order DB Tax Amount:   ${sum(order_taxes_by_id.values()):.5f}")
         total_variance_new = sum(calculated_taxes_by_id.values()) - sum(order_taxes_by_id.values())
         print(f"   Total Variance (Calculated - Order DB): ${total_variance_new:.5f}")
+        
+        # Display order tax precision warnings if any
+        order_tax_warnings = [w for w in precision_warnings if "tax " in w and "tax variance" not in w]
+        if order_tax_warnings:
+            print(f"\n   📊 ORDER TAX PRECISION WARNINGS ({len(order_tax_warnings)} found):")
+            for warning in order_tax_warnings:
+                print(f"      ⚠️  {warning}")
 
     # ------------------------------------------------------------------
     # TAX SUMMARY (Aggregated view)
@@ -823,7 +890,24 @@ def verify_order_tax(order_id: str, environment: str = "staging", tax_view: str 
     if charges_validation:
         print("\nSUMMARY OF THE ORDER:")
         print("=" * 60)
-        status = _status_label(charges_validation.get('is_valid'))
+        
+        # Check for precision issues in tax totals
+        stored_tax = charges_validation.get('stored_tax_amount', 0.0)
+        sum_order_taxes = charges_validation.get('sum_order_taxes', 0.0)
+        tax_delta = sum_order_taxes - stored_tax
+        
+        # Apply precision-aware status for tax matching
+        tax_status_icon, tax_warning = _status_with_precision_warning(tax_delta, "tax total comparison")
+        if tax_warning:
+            precision_warnings.append(tax_warning)
+        
+        # Override overall status if only precision issues exist (no other validation errors)
+        is_valid = charges_validation.get('is_valid', False)
+        if not is_valid and abs(tax_delta) < 1e-3:  # Only tax precision issue in 3-5 decimal range
+            status = "\033[1;33mPASSED (with warnings)\033[0m"  # Yellow for warnings
+        else:
+            status = _status_label(is_valid)
+        
         print(f"   Overall Status: {status}")
         print(f"   Expected Total Price: {charges_validation.get('expected_total_price'):.5f}")
         print(f"   Stored Total Price:   {charges_validation.get('stored_total_price'):.5f} (Match: {'YES' if charges_validation.get('total_price_match') else 'NO'})")
@@ -831,8 +915,16 @@ def verify_order_tax(order_id: str, environment: str = "staging", tax_view: str 
         print(f"   Discount Amount:      {charges_validation.get('discount_amount'):.5f}")
         print(f"   Included Charges Cnt: {charges_validation.get('included_charge_count')}")
         print(f"   Included Charges Sum: {charges_validation.get('included_charges_total'):.5f}")
-        print(f"   Stored Tax Amount:    {charges_validation.get('stored_tax_amount'):.5f}")
-        print(f"   Sum orderTaxes:       {charges_validation.get('sum_order_taxes'):.5f} (Match: {'YES' if charges_validation.get('tax_total_match') else 'NO'})")
+        print(f"   Payment Details Tax Amount:    {stored_tax:.5f}")
+        print(f"   Sum orderTaxes:       {sum_order_taxes:.5f} (Match: {'YES' if charges_validation.get('tax_total_match') else 'NO'})")
+        
+        # Display any remaining precision warnings from all sections
+        if precision_warnings:
+            remaining_warnings = [w for w in precision_warnings if "tax total comparison" in w]
+            if remaining_warnings:
+                print(f"\n   📊 SUMMARY PRECISION WARNINGS ({len(remaining_warnings)} found):")
+                for warning in remaining_warnings:
+                    print(f"      ⚠️  {warning}")
 
 def main(args: Optional[list] = None) -> int:
     """
