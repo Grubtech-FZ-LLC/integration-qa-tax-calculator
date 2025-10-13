@@ -625,7 +625,10 @@ def verify_order_tax(order_id: str, environment: str = "staging", tax_view: str 
                             mod_name_full = modifier.get('name', 'Unknown Modifier')
                             # Available space for modifier name after tree + icon + space
                             # Pattern: "└─ {icon} {name}" -> prefix_len = len("└─ ") + len(icon) + 1
-                            mod_icon = _status_icon(float(modifier.get('expected', 0.0)) - float(modifier.get('recomputed', 0.0)))
+                            # Use correct field names from verification module
+                            mod_expected = float(modifier.get('expected_tax', modifier.get('expected', 0.0)))
+                            mod_recomputed = float(modifier.get('recomputed_tax_final', modifier.get('recomputed', mod_expected)))
+                            mod_icon = _status_icon(mod_expected - mod_recomputed)
                             prefix = f"└─ {mod_icon} "
                             avail_len = item_cell_width - len(prefix)
                             if avail_len < 0:
@@ -633,7 +636,6 @@ def verify_order_tax(order_id: str, environment: str = "staging", tax_view: str 
                             mod_name_trunc = mod_name_full[:avail_len] if len(mod_name_full) > avail_len else mod_name_full
                             mod_cell = f"{prefix}{mod_name_trunc}".ljust(item_cell_width)
                             mod_qty = modifier.get('qty', 1)
-                            mod_expected = float(modifier.get('expected', 0.0))
                             mod_taxable = float(modifier.get('taxable_amount', 0.0))
                             print(
                                 f"   │  {mod_cell}  {mod_qty:>3}  {mod_taxable:>{taxable_w}.2f}  {mod_expected:>{tax_w}.5f}"
