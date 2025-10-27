@@ -747,11 +747,33 @@ def verify_order_tax(order_id: str, environment: str = "staging", tax_view: str 
         calculated_taxes_by_id = {}
         order_taxes_by_id = {}
         
-        # Collect calculated tax amounts from tree data
+        # Collect calculated tax amounts from tree data (menu taxes)
         for tax_info in extended_taxes:
             tax_id = tax_info.get('tax_id', 'Unknown')
             recomputed_total = float(tax_info.get('recomputed_total', 0.0))
             calculated_taxes_by_id[tax_id] = recomputed_total
+        
+        # Add charge taxes to the calculated totals (same tax ID should be summed)
+        for ch_entry in charge_entries:
+            ch_taxes = ch_entry.get('taxes', []) or []
+            for tx in ch_taxes:
+                tx_id = tx.get('taxId')
+                # Handle ObjectId format
+                if isinstance(tx_id, dict) and '$oid' in tx_id:
+                    tx_id = tx_id['$oid']
+                elif tx_id:
+                    tx_id = str(tx_id)
+                
+                if tx_id:
+                    tx_amount = float(tx.get('amount', 0.0))
+                    if tx_id in calculated_taxes_by_id:
+                        calculated_taxes_by_id[tx_id] += tx_amount
+                    else:
+                        calculated_taxes_by_id[tx_id] = tx_amount
+                    
+                    # Debug: Add precision warning for charge tax processing
+                    charge_warning = f"Added charge tax for {tx_id}: +{tx_amount:.5f} (total now: {calculated_taxes_by_id[tx_id]:.5f})"
+                    precision_warnings.append(charge_warning)
         
         # Collect orderTaxes from database
         for ot in order_taxes_section:
