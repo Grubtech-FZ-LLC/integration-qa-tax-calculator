@@ -53,3 +53,46 @@ class OrderRepository:
         db = self._client[self._db]
         coll = db[self._collection]
         return coll.find_one({"internalId": internal_id})
+    
+    def get_partner_config(self, partner_id: str, food_aggregator_id: str, 
+                          restaurant_id: str, kitchen_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Fetch partner configuration from PARTNER_APPLICATION collection.
+        
+        Mapping:
+        - partnerId -> partnerId
+        - foodAggragetorId -> applicationId
+        - restaurantId -> configuration.brandConfigurations.brandId
+        - kitchenId -> configuration.brandConfigurations.locationConfigurations.locationId
+        
+        Args:
+            partner_id: Partner ID from order
+            food_aggregator_id: Food aggregator ID from order
+            restaurant_id: Restaurant ID from order
+            kitchen_id: Kitchen ID from order
+            
+        Returns:
+            Partner configuration document or None if not found
+        """
+        if self._client is None:
+            self.connect()
+        db = self._client[self._db]
+        partner_app_coll = db["PARTNER_APPLICATION"]
+        
+        # Query matching nested structure in PARTNER_APPLICATION
+        query = {
+            "partnerId": partner_id,
+            "applicationId": food_aggregator_id,
+            "configuration.brandConfigurations": {
+                "$elemMatch": {
+                    "brandId": restaurant_id,
+                    "locationConfigurations": {
+                        "$elemMatch": {
+                            "locationId": kitchen_id
+                        }
+                    }
+                }
+            }
+        }
+        
+        return partner_app_coll.find_one(query)

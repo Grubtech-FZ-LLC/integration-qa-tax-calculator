@@ -51,13 +51,90 @@ Production environment:
 python -m smart_cal.cli verify-order --order-id {id} --env prod
 ```
 
+With partner configuration display:
+```bash
+python -m smart_cal.cli verify-order --order-id {id} --env prod --show-partner-config
+```
+
 Note: All calculations use 5-decimal precision. Default environment is staging if `--env` is omitted.
 
 Output Style: The TAX VERIFICATION section now renders in a hierarchical tree view by default (no extra flags needed).
 
+#### Optional Flags
+| Flag | Description |
+|------|-------------|
+| `--show-partner-config` | Display partner configuration from PARTNER_APPLICATION collection. Queries based on order's partnerId, foodAggragetorId, restaurantId, and kitchenId to show matching brand and location configuration including menu settings. |
+| `--tax-view {basic\|full\|failures}` | Tax detail level: `basic` (no aggregated table), `full` (include summary + reconciliation), `failures` (only rows with variances). Default: `basic` |
+| `--precision {2-8}` | Decimal precision for tax calculations (default: 5). Controls decimal places in r_j/(1+R) formula and validation tolerances. |
+| `--verbose` or `-v` | Enable verbose logging for debugging. |
+
 ---
 
-## 2. Discount & Tax Calculation Patterns
+## 2. Partner Configuration Display
+
+The `--show-partner-config` flag enables display of partner application configuration alongside tax verification. This feature queries the `PARTNER_APPLICATION` collection using relational mapping from the order document.
+
+### Relational Mapping
+| Order Field | Maps To | Partner Collection Field |
+|-------------|---------|--------------------------|
+| partnerId | → | partnerId |
+| foodAggragetorId | → | applicationId |
+| restaurantId | → | brandId (in brandConfigurations) |
+| kitchenId | → | locationId (in locationConfigurations) |
+
+### Query Strategy
+The feature uses MongoDB `$elemMatch` to perform nested queries:
+1. Match `partnerId` and `applicationId` at document level
+2. Match `brandId` within `brandConfigurations` array
+3. Match `locationId` within `locationConfigurations` array
+
+This ensures only the specific brand and location configuration matching the order is displayed (not all configurations in the document).
+
+### Display Format
+```
+🏢 PARTNER CONFIGURATION
+============================================================
+   Status: FOUND ✅
+   
+      Partner ID:         62f1234567890abcdef123456
+      Application ID:     5f9876543210fedcba987654
+      Brand ID:           1234567890123456789
+      
+         ═══ Location Configuration ═══
+         locationId:         9876543210987654321
+         status:             active
+         glovoLocationId:    12345
+         
+         menuConfiguration:
+            menuId:  5f1234567890abcdef123456
+            localeConfiguration:
+               currencyCode:  AED
+               timeZone:  Asia/Dubai
+            bagFeeItemId:  5f9876543210fedcba987654
+            deliveryFeeItemId:  5f1111222233334444555566
+```
+
+### Dynamic Field Discovery
+The display is **aggregator-agnostic** and shows all fields dynamically:
+- Only guaranteed common fields (`locationId`, `status`, `menuId`, `localeConfiguration`) have labels
+- All other fields (e.g., `glovoLocationId`, `talabatLocationId`, etc.) are discovered and displayed automatically
+- This ensures compatibility with any food aggregator without hardcoded field assumptions
+
+### Use Cases
+- Verify menu configuration matches expected settings
+- Debug discrepancies in tax calculations related to menu setup
+- Audit partner onboarding and configuration correctness
+- Cross-reference order data with partner application settings
+
+### Example
+```bash
+# Display partner config for production order
+python -m smart_cal.cli verify-order --order-id 1303647969745534976 --env prod --show-partner-config
+```
+
+---
+
+## 3. Discount & Tax Calculation Patterns
 
 Smart Cal auto-detects one of four mutually exclusive patterns based on presence of item-level and order-level discounts. All formulas assume tax-inclusive pricing (common in food service). When taxes are inclusive, we back out tax from a discounted gross using the aggregated rate R = Σ r_j of all applicable tax rates to that line.
 
@@ -144,7 +221,7 @@ python -m smart_cal.cli verify-order --order-id 1234567890123456789 --env stg
 
 ---
 
-## 3. Architecture (At a Glance)
+## 4. Architecture (At a Glance)
 
 ```
 CLI (smart_cal.cli)
@@ -161,7 +238,7 @@ Key design choices:
 - Proportional allocation for fairness & reversibility
 - Tolerance-based comparison to avoid false negatives
 
-## 4. Limitations & Assumptions
+## 5. Limitations & Assumptions
 - Pricing is tax-inclusive (no tax-exclusive branch yet)
 - Tax rates assumed additive (no compounding or cascading taxes)
 - Discounts are currency-amount (not percentage) by the time they reach the engine
@@ -169,7 +246,7 @@ Key design choices:
 - Repository expects a Mongo schema containing order-level taxes & line arrays
 - Pattern 4 degeneration when residual discount is numerically insignificant (≤ tolerance)
 
-## 5. Roadmap (Short List)
+## 6. Roadmap (Short List)
 | Planned | Description |
 |---------|-------------|
 | Tax-exclusive mode | Support orders priced net of tax |
@@ -178,7 +255,7 @@ Key design choices:
 | Anomaly codes | Machine parsable reason tags (e.g. ALLOC_DRIFT, TAX_MISMATCH) |
 | Configurable tolerance | CLI/env override instead of fixed constant |
 
-## 6. Testing
+## 7. Testing
 Basic test invocation (once you add tests):
 ```bash
 pytest -q
@@ -194,7 +271,7 @@ Suggested minimal tests to add:
 
 Fixture idea: store 1 synthetic JSON per pattern under `tests/fixtures/`.
 
-## 7. Extending the Engine
+## 8. Extending the Engine
 | Task | Where |
 |------|-------|
 | Add new pattern detection | Extend logic inside `verification.py` (classifier section) |

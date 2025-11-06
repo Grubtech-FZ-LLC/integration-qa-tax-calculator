@@ -89,12 +89,18 @@ Examples:
         choices=[2, 3, 4, 5, 6, 7, 8],
         help="Decimal precision for tax calculations (default: 5). Controls the number of decimal places used in r_j/(1+R) formula and validation tolerances."
     )
+    
+    verify_parser.add_argument(
+        "--show-partner-config",
+        action="store_true",
+        help="Display partner configuration from PARTNER_APPLICATION collection"
+    )
 
     
     return parser
 
 
-def verify_order_tax(order_id: str, environment: str = "staging", tax_view: str = "basic", precision: int = 5) -> None:
+def verify_order_tax(order_id: str, environment: str = "staging", tax_view: str = "basic", precision: int = 5, show_partner_config: bool = False) -> None:
     """
     Verify tax calculations for a MongoDB order with enhanced precision support.
     
@@ -103,6 +109,7 @@ def verify_order_tax(order_id: str, environment: str = "staging", tax_view: str 
         environment: Database environment ("staging", "production", "stg", "prod")
         tax_view: Tax detail level ("basic", "full", "failures")
         precision: Decimal precision for tax calculations (2-8, default: 5)
+        show_partner_config: Whether to display partner configuration from PARTNER_APPLICATION
     """
     logger = setup_logging()
     logger.info(f"Verifying tax for order: {order_id} in {environment} environment")
@@ -519,17 +526,66 @@ def verify_order_tax(order_id: str, environment: str = "staging", tax_view: str 
         recon_lookup = {tr.get('tax_id'): tr for tr in tax_recon}
         
         # Enhance existing menu taxes with proper names from orderTaxes
+        # Also aggregate charge taxes into menu taxes if they share the same tax ID
         enhanced_taxes = []
         for tax in taxes:
             tax_id = tax.get('tax_id')
             order_tax_info = order_tax_lookup.get(tax_id, {})
             enhanced_tax = dict(tax)
             enhanced_tax['tax_name'] = order_tax_info.get('name', 'Tax')
+            
+            # Find matching charge tax for this specific menu tax ID
+            # This ensures we ONLY aggregate charge tax when it's the SAME tax (not different taxes)
+            matching_charge_tax = 0.0
+            for charge_tid in charge_tax_ids:
+                # Use the same matching logic as _is_tax_in_menu to ensure consistency
+                tax_ids_match = False
+                
+                if charge_tid == tax_id:
+                    tax_ids_match = True
+                # Handle short ID (8 char) matching end of full ID (24 char)
+                elif len(charge_tid) == 8 and len(tax_id) > 8 and tax_id.endswith(charge_tid):
+                    tax_ids_match = True
+                # Handle full ID matching end of short ID (reverse case)
+                elif len(tax_id) == 8 and len(charge_tid) > 8 and charge_tid.endswith(tax_id):
+                    tax_ids_match = True
+                
+                if tax_ids_match:
+                    # Get charge tax amount from reconciliation for THIS specific tax ID
+                    # Try both the charge_tid and tax_id as keys since reconciliation might use either format
+                    matching_charge_tax = (
+                        recon_lookup.get(tax_id, {}).get('charges_tax', 0.0) or
+                        recon_lookup.get(charge_tid, {}).get('charges_tax', 0.0)
+                    )
+                    break  # Found the matching charge tax, stop looking
+            
+            # Add charge tax to menu tax for proper aggregation (only if same tax)
+            if matching_charge_tax > 0:
+                enhanced_tax['recomputed_total'] = enhanced_tax.get('recomputed_total', 0.0) + matching_charge_tax
+                enhanced_tax['expected_total'] = enhanced_tax.get('expected_total', 0.0) + matching_charge_tax
+            
             enhanced_taxes.append(enhanced_tax)
         
-        # Add charge-only taxes
+        # Helper function to check if charge tax ID matches any menu tax ID
+        # This handles both short (8 char) and full (24 char) tax ID formats
+        def _is_tax_in_menu(charge_tid: str, menu_tids: set) -> bool:
+            """Check if charge tax ID matches any menu tax ID (handles short/full ID formats)."""
+            if charge_tid in menu_tids:
+                return True
+            # Check if charge_tid is a short ID that matches the end of any menu tax ID
+            if len(charge_tid) == 8:
+                for menu_tid in menu_tids:
+                    if menu_tid.endswith(charge_tid) and len(menu_tid) > 8:
+                        return True
+            # Check if charge_tid is a full ID that ends with any short menu tax ID
+            for menu_tid in menu_tids:
+                if len(menu_tid) == 8 and charge_tid.endswith(menu_tid) and len(charge_tid) > 8:
+                    return True
+            return False
+        
+        # Add charge-only taxes (skip if tax already exists in menu items)
         for charge_tax_id in charge_tax_ids:
-            if charge_tax_id not in menu_tax_ids:
+            if not _is_tax_in_menu(charge_tax_id, menu_tax_ids):
                 # Get tax info from orderTaxes or reconciliation - try multiple approaches
                 order_tax_info = order_tax_lookup.get(charge_tax_id, {})
                 
@@ -747,33 +803,12 @@ def verify_order_tax(order_id: str, environment: str = "staging", tax_view: str 
         calculated_taxes_by_id = {}
         order_taxes_by_id = {}
         
-        # Collect calculated tax amounts from tree data (menu taxes)
+        # Collect calculated tax amounts from tree data (includes menu + charges)
+        # Note: extended_taxes already includes charge-only taxes, so no need to add them separately
         for tax_info in extended_taxes:
             tax_id = tax_info.get('tax_id', 'Unknown')
             recomputed_total = float(tax_info.get('recomputed_total', 0.0))
             calculated_taxes_by_id[tax_id] = recomputed_total
-        
-        # Add charge taxes to the calculated totals (same tax ID should be summed)
-        for ch_entry in charge_entries:
-            ch_taxes = ch_entry.get('taxes', []) or []
-            for tx in ch_taxes:
-                tx_id = tx.get('taxId')
-                # Handle ObjectId format
-                if isinstance(tx_id, dict) and '$oid' in tx_id:
-                    tx_id = tx_id['$oid']
-                elif tx_id:
-                    tx_id = str(tx_id)
-                
-                if tx_id:
-                    tx_amount = float(tx.get('amount', 0.0))
-                    if tx_id in calculated_taxes_by_id:
-                        calculated_taxes_by_id[tx_id] += tx_amount
-                    else:
-                        calculated_taxes_by_id[tx_id] = tx_amount
-                    
-                    # Debug: Add precision warning for charge tax processing
-                    charge_warning = f"Added charge tax for {tx_id}: +{tx_amount:.5f} (total now: {calculated_taxes_by_id[tx_id]:.5f})"
-                    precision_warnings.append(charge_warning)
         
         # Collect orderTaxes from database
         for ot in order_taxes_section:
@@ -947,6 +982,179 @@ def verify_order_tax(order_id: str, environment: str = "staging", tax_view: str 
                 print(f"\n   📊 SUMMARY PRECISION WARNINGS ({len(remaining_warnings)} found):")
                 for warning in remaining_warnings:
                     print(f"      ⚠️  {warning}")
+    
+    # Display partner configuration if requested
+    if show_partner_config:
+        # Need to fetch the raw order document to get partner IDs
+        from .tax_calculation.repository import OrderRepository
+        try:
+            with OrderRepository(
+                db_name=db_name,
+                connection_url_env_key=config["connection_url"]
+            ) as repo:
+                order_doc = repo.get_order_by_internal_id(order_id)
+                if order_doc:
+                    display_partner_configuration(order_id, environment, config, db_name, order_doc)
+                else:
+                    print("\n⚠️  PARTNER CONFIGURATION:")
+                    print("=" * 60)
+                    print("   Unable to fetch order document")
+        except Exception as e:
+            logger.error(f"Error fetching order for partner config: {e}")
+            print("\n⚠️  PARTNER CONFIGURATION:")
+            print("=" * 60)
+            print(f"   Error: {e}")
+
+
+def display_partner_configuration(order_id: str, environment: str, config: dict, db_name: str, order_doc: dict) -> None:
+    """
+    Display partner configuration from PARTNER_APPLICATION collection.
+    
+    Args:
+        order_id: Order internal ID
+        environment: Environment (staging/production)
+        config: Database configuration
+        db_name: Database name
+        order_doc: Raw order document from MongoDB
+    """
+    from .tax_calculation.repository import OrderRepository
+    
+    logger = setup_logging()
+    
+    # Extract partner-related IDs from the order document
+    partner_id = order_doc.get('partnerId')
+    food_aggregator_id = order_doc.get('foodAggragetorId')
+    restaurant_id = order_doc.get('restaurantId')
+    kitchen_id = order_doc.get('kitchenId')
+    
+    if not all([partner_id, food_aggregator_id, restaurant_id, kitchen_id]):
+        print("\n⚠️  PARTNER CONFIGURATION:")
+        print("=" * 60)
+        print("   Unable to fetch partner configuration: Missing required IDs")
+        print(f"   partnerId: {partner_id or 'N/A'}")
+        print(f"   foodAggragetorId: {food_aggregator_id or 'N/A'}")
+        print(f"   restaurantId: {restaurant_id or 'N/A'}")
+        print(f"   kitchenId: {kitchen_id or 'N/A'}")
+        return
+    
+    try:
+        with OrderRepository(
+            db_name=db_name,
+            connection_url_env_key=config["connection_url"]
+        ) as repo:
+            partner_config = repo.get_partner_config(
+                partner_id=partner_id,
+                food_aggregator_id=food_aggregator_id,
+                restaurant_id=restaurant_id,
+                kitchen_id=kitchen_id
+            )
+        
+        print("\n🏢 PARTNER CONFIGURATION")
+        print("=" * 60)
+        
+        if not partner_config:
+            print("   Status: NOT FOUND")
+            print(f"   Query Parameters:")
+            print(f"      Partner ID:         {partner_id}")
+            print(f"      Application ID:     {food_aggregator_id}")
+            print(f"      Brand ID:           {restaurant_id}")
+            print(f"      Location ID:        {kitchen_id}")
+            return
+        
+        print("   Status: FOUND ✅")
+        print(f"\n      Partner ID:         {partner_config.get('partnerId', 'N/A')}")
+        print(f"      Application ID:     {partner_config.get('applicationId', 'N/A')}")
+        
+        # Display configuration details - ONLY for the matching brand and location
+        config_data = partner_config.get('configuration', {})
+        if config_data:
+            # Display brand configurations - filter to show only the matching brand
+            brand_configs = config_data.get('brandConfigurations', [])
+            if brand_configs:
+                # Find the matching brand configuration
+                matching_brand = None
+                matching_location = None
+                
+                for brand_config in brand_configs:
+                    brand_id = brand_config.get('brandId')
+                    if brand_id == restaurant_id:
+                        matching_brand = brand_config
+                        # Find the matching location within this brand
+                        location_configs = brand_config.get('locationConfigurations', [])
+                        for loc_config in location_configs:
+                            location_id = loc_config.get('locationId')
+                            if location_id == kitchen_id:
+                                matching_location = loc_config
+                                break
+                        break
+                
+                # Display only the matching brand and location
+                if matching_brand:
+                    print(f"      Brand ID:           {matching_brand.get('brandId', 'N/A')}")
+                    
+                    if matching_location:
+                        print(f"\n         ═══ Location Configuration ═══")
+                        
+                        # Display ONLY guaranteed common fields with labels
+                        location_id = matching_location.get('locationId', 'N/A')
+                        status = matching_location.get('status', 'N/A')
+                        print(f"         locationId:         {location_id}")
+                        print(f"         status:             {status}")
+                        
+                        # Display ALL other location-level fields dynamically (aggregator-specific)
+                        # Exclude only the common structural fields we already displayed
+                        excluded_fields = {'locationId', 'status', 'menuConfiguration', '_id'}
+                        other_location_fields = {k: v for k, v in matching_location.items() 
+                                               if k not in excluded_fields and v is not None}
+                        
+                        if other_location_fields:
+                            for key, value in sorted(other_location_fields.items()):
+                                print(f"         {key}:  {value}")
+                        
+                        # Display menu configuration
+                        menu_config = matching_location.get('menuConfiguration', {})
+                        if menu_config:
+                            print(f"\n         menuConfiguration:")
+                            
+                            # Display menuId (only guaranteed common field in menuConfiguration)
+                            menu_id = menu_config.get('menuId')
+                            if menu_id:
+                                print(f"            menuId:  {menu_id}")
+                            
+                            # Display localeConfiguration (common nested structure)
+                            locale_config = menu_config.get('localeConfiguration', {})
+                            if locale_config:
+                                print(f"            localeConfiguration:")
+                                for locale_key, locale_value in sorted(locale_config.items()):
+                                    print(f"               {locale_key}:  {locale_value}")
+                            
+                            # Display ALL other menuConfiguration fields dynamically
+                            excluded_menu_fields = {'menuId', 'localeConfiguration', '_id'}
+                            other_menu_fields = {k: v for k, v in menu_config.items() 
+                                               if k not in excluded_menu_fields and v is not None}
+                            
+                            if other_menu_fields:
+                                for key, value in sorted(other_menu_fields.items()):
+                                    # Handle nested objects
+                                    if isinstance(value, dict):
+                                        print(f"            {key}:")
+                                        for nested_key, nested_value in sorted(value.items()):
+                                            print(f"               {nested_key}:  {nested_value}")
+                                    else:
+                                        print(f"            {key}:  {value}")
+                    else:
+                        print(f"\n         ⚠️  Location not found in configuration")
+                        print(f"         Searching for locationId: {kitchen_id}")
+                else:
+                    print(f"\n      ⚠️  Brand not found in configuration")
+                    print(f"      Searching for brandId: {restaurant_id}")
+    
+    except Exception as e:
+        logger.error(f"Error fetching partner configuration: {e}")
+        print("\n⚠️  PARTNER CONFIGURATION:")
+        print("=" * 60)
+        print(f"   Error: {e}")
+
 
 def main(args: Optional[list] = None) -> int:
     """
@@ -971,7 +1179,8 @@ def main(args: Optional[list] = None) -> int:
                 order_id=parsed_args.order_id,
                 environment=parsed_args.env,
                 tax_view=getattr(parsed_args, 'tax_view', 'basic'),
-                precision=getattr(parsed_args, 'precision', 5)
+                precision=getattr(parsed_args, 'precision', 5),
+                show_partner_config=getattr(parsed_args, 'show_partner_config', False)
             )
             
         elif not parsed_args.command:
