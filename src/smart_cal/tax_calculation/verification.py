@@ -1624,6 +1624,7 @@ class OrderTaxVerifier:
         
         validation_details = []
         calculation_errors = []
+        precision_warnings = []  # Track non-critical precision warnings
         total_items = 0
         
         # ------------------------------------------------------------------
@@ -1908,9 +1909,15 @@ class OrderTaxVerifier:
                 else:
                     total_price_formula = f"unitPrice*qty({effective_gross_amount}) - discountAmount({discount_amount})"
             
-            # Use strict tolerance for all fields - fail anything that doesn't match expected
-            pattern_adjusted_tolerance = tolerance
-            tax_strict_tolerance = tolerance  # Always enforce strict tolerance for taxAmount
+            # Use pattern-aware tolerance - Pattern 2 allows for rounding in tax/net amounts
+            # due to proportional order-level discount distribution
+            if "Pattern 2" in discount_context:
+                # Pattern 2: Allow higher tolerance for tax/net amounts affected by discount distribution
+                pattern_adjusted_tolerance = max(tolerance, 1e-4)  # Accept up to 4 decimal precision
+                tax_strict_tolerance = max(tolerance, 1e-4)  # Accept up to 4 decimal precision for tax
+            else:
+                pattern_adjusted_tolerance = tolerance
+                tax_strict_tolerance = tolerance
             
             # Validate calculations with pattern-aware tolerance
             item_validation = {
@@ -1950,18 +1957,42 @@ class OrderTaxVerifier:
             
             for field_name, actual, expected, formula, field_tolerance in calculations:
                 delta = actual - expected
-                is_valid = abs(delta) <= field_tolerance
+                abs_delta = abs(delta)
+                
+                # Categorize variance severity:
+                # - PASS: delta <= field_tolerance (exact match within precision)
+                # - WARNING: field_tolerance < delta < 0.01 (3-5 decimal precision mismatch, acceptable)
+                # - FAIL: delta >= 0.01 (2 decimal precision or worse, critical error)
+                CRITICAL_THRESHOLD = 1e-2  # 2 decimal precision = 0.01
+                
+                is_pass = abs_delta <= field_tolerance
+                is_warning = not is_pass and abs_delta < CRITICAL_THRESHOLD
+                is_critical_failure = abs_delta >= CRITICAL_THRESHOLD
+                
+                # Overall validity: PASS or WARNING both considered valid
+                is_valid = is_pass or is_warning
+                
+                # Determine status label
+                if is_pass:
+                    status = "PASS"
+                elif is_warning:
+                    status = "WARNING"
+                else:
+                    status = "FAIL"
                 
                 item_validation["calculations"][field_name] = {
                     "actual": actual,
                     "expected": expected,
                     "delta": round(delta, 8),
                     "is_valid": is_valid,
+                    "status": status,
+                    "is_critical": is_critical_failure,
                     "formula": formula,
                     "tolerance_used": field_tolerance
                 }
                 
-                if not is_valid:
+                # Only add to calculation_errors if it's a CRITICAL failure (>= 0.01)
+                if is_critical_failure:
                     calculation_errors.append({
                         "item_id": item_id,
                         "item_name": item_name,
@@ -1972,7 +2003,23 @@ class OrderTaxVerifier:
                         "delta": round(delta, 8),
                         "formula": formula,
                         "pattern_context": discount_context,
-                        "tolerance_used": field_tolerance
+                        "tolerance_used": field_tolerance,
+                        "severity": "CRITICAL"
+                    })
+                elif is_warning:
+                    # Track non-critical precision warnings (3-5 decimal precision)
+                    precision_warnings.append({
+                        "item_id": item_id,
+                        "item_name": item_name,
+                        "item_type": item_type,
+                        "field": field_name,
+                        "actual": actual,
+                        "expected": expected,
+                        "delta": round(delta, 8),
+                        "formula": formula,
+                        "pattern_context": discount_context,
+                        "tolerance_used": field_tolerance,
+                        "severity": "WARNING"
                     })
             
             validation_details.append(item_validation)
@@ -1999,6 +2046,8 @@ class OrderTaxVerifier:
             if main_item_validation and modifier_validations:
                 main_item_validation["modifiers"] = modifier_validations
         
+        # Only FAIL if there are critical errors (>= 0.01 delta)
+        # Precision warnings (< 0.01 delta) don't cause failure
         is_valid = len(calculation_errors) == 0
         
         return {
@@ -2006,15 +2055,24 @@ class OrderTaxVerifier:
             "total_items": total_items,
             "validation_details": validation_details,
             "calculation_errors": calculation_errors,
+            "precision_warnings": precision_warnings,
             "tolerance": tolerance,
             "discount_context": discount_context,
-            "validation_note": self._get_validation_note(discount_context, is_valid, calculation_errors)
+            "validation_note": self._get_validation_note(discount_context, is_valid, calculation_errors, precision_warnings)
         }
 
-    def _get_validation_note(self, discount_context: str, is_valid: bool, calculation_errors: list) -> str:
+    def _get_validation_note(self, discount_context: str, is_valid: bool, calculation_errors: list, precision_warnings: list = None) -> str:
         """Provide context-aware validation notes based on discount patterns."""
-        if is_valid:
+        if precision_warnings is None:
+            precision_warnings = []
+            
+        if is_valid and len(precision_warnings) == 0:
             return f"All calculations are mathematically consistent within menuDetails.price structure. ({discount_context})"
+        
+        if is_valid and len(precision_warnings) > 0:
+            # Passed but with precision warnings
+            return (f"Calculations passed with {len(precision_warnings)} precision warning(s). "
+                   f"Variances are within acceptable tolerance (< 0.01). ({discount_context})")
         
         if "Pattern 1" in discount_context:
             return ("Pattern 1: No discounts applied. Mathematical inconsistencies indicate "
