@@ -1,5 +1,5 @@
 """
-Logging utilities for the Smart Cal CLI tool.
+Logging utilities for the Integration QA Tax Calculator CLI tool.
 """
 
 import logging

@@ -1,5 +1,5 @@
 """
-Configuration utilities for the Smart Cal CLI tool.
+Configuration utilities for the Integration QA Tax Calculator CLI tool.
 """
 
 import os
@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 
 
 class Config:
-    """Configuration manager for the Smart Cal project."""
+    """Configuration manager for the Integration QA Tax Calculator project."""
 
     def __init__(self, env_file: Optional[str] = None) -> None:
         """Initialize configuration.

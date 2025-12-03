@@ -1,5 +1,5 @@
 """
-Smart Cal - MongoDB Order Tax Verification CLI Tool
+Integration QA Tax Calculator - MongoDB Order Tax Verification CLI Tool
 
 A streamlined CLI tool for verifying tax calculations in restaurant orders
 stored in MongoDB databases. Supports staging and production environments.

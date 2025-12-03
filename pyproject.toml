@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "smart-cal"
+name = "integration-qa-tax-calculator"
 version = "0.1.0"
-description = "A modular Python project for tax calculations and utilities"
+description = "Lightweight tax & discount pattern verification for restaurant / commerce orders"
 readme = "README.md"
 license = {text = "MIT"}
 authors = [
@@ -57,13 +57,13 @@ docs = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/yourusername/smart-cal"
-Repository = "https://github.com/yourusername/smart-cal"
-Documentation = "https://smart-cal.readthedocs.io"
-"Bug Tracker" = "https://github.com/yourusername/smart-cal/issues"
+Homepage = "https://github.com/Grubtech-FZ-LLC/integration-qa-tax-calculator"
+Repository = "https://github.com/Grubtech-FZ-LLC/integration-qa-tax-calculator"
+Documentation = "https://github.com/Grubtech-FZ-LLC/integration-qa-tax-calculator#readme"
+"Bug Tracker" = "https://github.com/Grubtech-FZ-LLC/integration-qa-tax-calculator/issues"
 
 [project.scripts]
-smart-cal = "smart_cal.cli:main"
+tax-calculator = "smart_cal.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

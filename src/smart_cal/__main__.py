@@ -1,5 +1,5 @@
 """
-Entry point for running smart_cal as a module.
+Entry point for running integration-qa-tax-calculator as a module.
 """
 
 from .cli import main

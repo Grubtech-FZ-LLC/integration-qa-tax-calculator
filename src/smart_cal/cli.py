@@ -1,5 +1,5 @@
 """
-Command-line interface for Smart Cal.
+Command-line interface for Integration QA Tax Calculator.
 """
 
 import argparse
@@ -16,21 +16,21 @@ from .tax_calculation.verification import TaxVerificationService
 def create_parser() -> argparse.ArgumentParser:
     """Create and configure the argument parser."""
     parser = argparse.ArgumentParser(
-        description="Smart Cal - MongoDB Order Tax Verification Tool",
+        description="Integration QA Tax Calculator - MongoDB Order Tax Verification Tool",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  smart-cal --version
-  smart-cal --help
-  smart-cal verify-order --order-id 1283987880027074560 --env production
-  smart-cal verify-order --order-id 1283965554531573760 --env staging
+  tax-calculator --version
+  tax-calculator --help
+  tax-calculator verify-order --order-id 1283987880027074560 --env production
+  tax-calculator verify-order --order-id 1283965554531573760 --env staging
         """,
     )
     
     parser.add_argument(
         "--version",
         action="version",
-        version=f"Smart Cal {__version__}",
+        version=f"Integration QA Tax Calculator {__version__}",
     )
     
     parser.add_argument(
