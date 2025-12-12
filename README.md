@@ -38,10 +38,10 @@ TAX_INCLUSIVE=true
 verify-order.bat <order-id> [options]
 
 # Examples:
-verify-order.bat 1313394568122470400                    # staging (default)
-verify-order.bat 1313394568122470400 -e prod            # production
-verify-order.bat 1313394568122470400 -e prod -p         # with partner config
-verify-order.bat 1313394568122470400 -t full -v         # full tax view + verbose
+.\verify-order.bat 1313394568122470400                    # staging (default)
+.\verify-order.bat 1313394568122470400 -e prod            # production
+.\verify-order.bat 1313394568122470400 -e prod -p         # with partner config
+.\verify-order.bat 1313394568122470400 -t full -v         # full tax view + verbose
 ```
 
 ### Options
